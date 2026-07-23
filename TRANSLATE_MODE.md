@@ -3,13 +3,13 @@
 A tool under **System → Translate Mode** that reads the text a DS game is drawing
 **right now** and lets you translate it.
 
-## Translate ROM text (real game text → translated .nds)
+## ROM text tab (real game text → translated .nds)
 
-A second tool under **System → Translate ROM text** works at the ROM level (not
-the screen): it parses the cartridge's NDS filesystem, finds the game's
-pointer-table Shift-JIS text files and shows every string as **real, readable,
-editable text**. Type a translation and **Create translated ROM...** writes a
-patched `.nds`.
+Inside **Translate Mode** there are two tabs. The **ROM text** tab works at the
+ROM level (not the screen): it parses the cartridge's NDS filesystem, finds the
+game's pointer-table Shift-JIS text files and shows every string as **real,
+readable, editable text**. Type a translation and **Create translated ROM...**
+writes a patched `.nds`.
 
 * Decodes the game's actual cp932 text (rules, menus, titles, pauses, prompts…).
 * Untranslated lines are written back byte-for-byte (safe round-trip); only the

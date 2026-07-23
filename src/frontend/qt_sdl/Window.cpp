@@ -58,7 +58,6 @@
 #include "ROMInfoDialog.h"
 #include "RAMInfoDialog.h"
 #include "TranslateWindow.h"
-#include "RomTextDialog.h"
 #include "TitleManagerDialog.h"
 #include "PowerManagement/PowerManagementDialog.h"
 
@@ -409,9 +408,6 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
 
                 actTranslateMode = menu->addAction("Translate Mode");
                 connect(actTranslateMode, &QAction::triggered, this, &MainWindow::onOpenTranslateMode);
-
-                actRomText = menu->addAction("Translate ROM text");
-                connect(actRomText, &QAction::triggered, this, &MainWindow::onOpenRomText);
 
                 actTitleManager = menu->addAction("Manage DSi titles");
                 connect(actTitleManager, &QAction::triggered, this, &MainWindow::onOpenTitleManager);
@@ -1742,11 +1738,6 @@ void MainWindow::onRAMInfo()
 void MainWindow::onOpenTranslateMode()
 {
     TranslateWindow* dlg = TranslateWindow::openDlg(this);
-}
-
-void MainWindow::onOpenRomText()
-{
-    RomTextDialog* dlg = RomTextDialog::openDlg(this);
 }
 
 void MainWindow::onOpenTitleManager()

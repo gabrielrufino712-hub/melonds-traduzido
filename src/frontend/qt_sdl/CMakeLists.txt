@@ -32,7 +32,6 @@ set(SOURCES_QT_SDL
     ROMInfoDialog.cpp
     RAMInfoDialog.cpp
     TranslateWindow.cpp
-    RomTextDialog.cpp
     TitleManagerDialog.cpp
     OSD_shaders.h
     font.h

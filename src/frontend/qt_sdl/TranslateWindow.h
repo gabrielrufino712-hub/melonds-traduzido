@@ -53,9 +53,21 @@ class QLineEdit;
 class QLabel;
 class QImage;
 class QNetworkAccessManager;
+class QTabWidget;
 class EmuInstance;
 
 namespace melonDS { class NDS; class GPU2D; }
+
+// One text file inside the cartridge ROM (pointer-table Shift-JIS).
+struct RomTextFile
+{
+    QString path;
+    melonDS::u32 start = 0;
+    melonDS::u32 end = 0;
+    QVector<QString> originals;
+    QVector<QString> translations;
+    QVector<QByteArray> raws;
+};
 
 // A run of tiles forming one on-screen text line.
 struct ScreenLine
@@ -124,6 +136,13 @@ private slots:
     void onAutoOCR();
     void onTranslateNow();
     void onAutoTranslateToggled(bool on);
+    // ROM text tab
+    void onRomScan();
+    void onRomFilterChanged(const QString& text);
+    void onRomCellChanged(int row, int col);
+    void onRomSaveProject();
+    void onRomLoadProject();
+    void onRomCreateRom();
     void onTopCellChanged(int row, int col);
     void onBottomCellChanged(int row, int col);
     void onSaveProject();
@@ -146,6 +165,8 @@ private:
     void refreshPauseButton();
     void highlightBottomLine(int lineIndex);
     QTableWidget* activeTable();
+    void rebuildRomTable();
+    const melonDS::u8* romData(melonDS::u32& len);
     quint64 tileMask(int engineNum, int kind, int bg, int tile);
     void buildOcrRef();
     void translateSig(const QString& sig, const QString& text);
@@ -184,6 +205,14 @@ private:
     bool inspectArmed = false;
     int  highlightedRow = -1;
     bool updatingTable = false;
+
+    // ROM text tab
+    QTableWidget* romTable = nullptr;
+    QLineEdit*    romFilter = nullptr;
+    QLabel*       romStatus = nullptr;
+    std::vector<RomTextFile> RomFiles;
+    QVector<QPair<int,int>> RomRows;
+    bool updatingRom = false;
 };
 
 #endif // TRANSLATEWINDOW_H
