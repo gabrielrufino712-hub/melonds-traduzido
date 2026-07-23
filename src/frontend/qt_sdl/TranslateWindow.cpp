@@ -37,10 +37,22 @@
 #include <QJsonArray>
 #include <QColor>
 #include <QBrush>
+#include <QImage>
+#include <QPixmap>
+#include <QIcon>
+#include <QPainter>
+#include <QFont>
+#include <QFontDatabase>
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QUrl>
+#include <QUrlQuery>
 #include <QStringConverter>
 #include <vector>
 #include <unordered_map>
 #include <cstdlib>
+#include <bitset>
 
 #include "main.h"
 #include "EmuInstance.h"
@@ -65,6 +77,7 @@ TranslateWindow::TranslateWindow(QWidget* parent) : QDialog(parent)
     resize(1040, 620);
 
     emuInstance = ((MainWindow*)parent)->getEmuInstance();
+    net = new QNetworkAccessManager(this);
 
     auto* root = new QVBoxLayout(this);
 
@@ -86,6 +99,12 @@ TranslateWindow::TranslateWindow(QWidget* parent) : QDialog(parent)
     chkHex = new QCheckBox("Show tile codes", this);
     chkHex->setToolTip("Show raw tile numbers instead of decoded text.");
     bar->addWidget(chkHex);
+
+    chkGlyph = new QCheckBox("Show glyphs", this);
+    chkGlyph->setChecked(true);
+    chkGlyph->setToolTip("Draw each tile's actual pixels, so you SEE the Japanese "
+                         "characters (as images) even without a table.");
+    bar->addWidget(chkGlyph);
 
     bar->addWidget(new QLabel("Min length:", this));
     spnMinRun = new QSpinBox(this);
@@ -124,6 +143,34 @@ TranslateWindow::TranslateWindow(QWidget* parent) : QDialog(parent)
     bar->addStretch();
     root->addLayout(bar);
 
+    // ---- second row: OCR + translation ----
+    auto* bar2 = new QHBoxLayout();
+
+    auto* btnOCR = new QPushButton("Auto-OCR glyphs", this);
+    btnOCR->setToolTip("Best-effort: guess characters by matching each tile's shape to "
+                       "a system font (kana/latin work best; kanji is unreliable).");
+    connect(btnOCR, &QPushButton::clicked, this, &TranslateWindow::onAutoOCR);
+    bar2->addWidget(btnOCR);
+
+    chkTranslate = new QCheckBox("Auto-translate (online)", this);
+    chkTranslate->setToolTip("Translate decoded lines in real time via an online service "
+                             "(needs internet; only works on lines that are real text).");
+    connect(chkTranslate, &QCheckBox::toggled, this, &TranslateWindow::onAutoTranslateToggled);
+    bar2->addWidget(chkTranslate);
+
+    bar2->addWidget(new QLabel("to:", this));
+    txtLang = new QLineEdit("pt", this);
+    txtLang->setFixedWidth(44);
+    txtLang->setToolTip("Target language code, e.g. pt, en, es.");
+    bar2->addWidget(txtLang);
+
+    auto* btnTr = new QPushButton("Translate now", this);
+    connect(btnTr, &QPushButton::clicked, this, &TranslateWindow::onTranslateNow);
+    bar2->addWidget(btnTr);
+
+    bar2->addStretch();
+    root->addLayout(bar2);
+
     // ---- two tables side by side ----
     auto* tables = new QHBoxLayout();
 
@@ -142,6 +189,7 @@ TranslateWindow::TranslateWindow(QWidget* parent) : QDialog(parent)
         t->setColumnWidth(COL_POS, 54);
         t->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed | QAbstractItemView::AnyKeyPressed);
         t->setSelectionBehavior(QAbstractItemView::SelectRows);
+        t->setIconSize(QSize(360, 20));
         box->addWidget(t);
         tables->addLayout(box);
         return t;
@@ -314,6 +362,60 @@ QString TranslateWindow::decodeLine(const QVector<int>& tiles)
     QString s;
     for (int t : tiles) s += QString("%1 ").arg(t, 3, 16, QChar('0'));
     return s.trimmed();
+}
+
+// Draw the actual pixels of each tile so the user SEES the glyphs (monochrome:
+// ink = any non-zero pixel). Works without a table. Fully bounds-checked.
+QImage TranslateWindow::renderLineImage(const ScreenLine& ln)
+{
+    NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
+    int n = ln.tiles.size();
+    QImage img(qMax(1, n * 8), 8, QImage::Format_ARGB32);
+    img.fill(qRgba(255, 255, 255, 255));
+    if (!nds || n == 0) return img;
+
+    GPU2D& eng = ln.engineNum ? nds->GPU.GPU2D_B : nds->GPU.GPU2D_A;
+
+    u8* vram = nullptr; u32 mask = 0;
+    bool bpp8 = false;
+    u32 charBase = 0;
+    if (ln.kind == 0)
+    {
+        u16 bgcnt = eng.BGCnt[ln.bg];
+        u32 dispcnt = eng.DispCnt;
+        bpp8 = bgcnt & 0x80;
+        charBase = ((bgcnt >> 2) & 0x3) * 0x4000u
+                 + ((ln.engineNum == 0) ? (((dispcnt >> 24) & 0x7) * 0x10000u) : 0u);
+        eng.GetBGVRAM(vram, mask);
+    }
+    else
+    {
+        bpp8 = false; // OBJ text is almost always 4bpp
+        charBase = 0;
+        eng.GetOBJVRAM(vram, mask);
+    }
+    if (!vram || mask == 0) return img;
+
+    const u32 tileBytes = bpp8 ? 64u : 32u;
+    for (int t = 0; t < n; t++)
+    {
+        u32 base = charBase + (u32)ln.tiles[t] * tileBytes;
+        for (int row = 0; row < 8; row++)
+            for (int col = 0; col < 8; col++)
+            {
+                int px;
+                if (bpp8)
+                    px = vram[(base + row * 8 + col) & mask];
+                else
+                {
+                    u8 b = vram[(base + row * 4 + col / 2) & mask];
+                    px = (col & 1) ? (b >> 4) : (b & 0x0F);
+                }
+                if (px != 0)
+                    img.setPixel(t * 8 + col, row, qRgba(0, 0, 0, 255));
+            }
+    }
+    return img;
 }
 
 // ---------------------------------------------------------------------------
@@ -498,6 +600,9 @@ void TranslateWindow::refresh(bool force)
     lblStatus->setText(QString("On screen now - top: %1 line(s), bottom: %2 line(s)%3")
                        .arg(topLines.size()).arg(botLines.size())
                        .arg(Table.isLoaded() ? "" : "   (load a tile .tbl to read letters)"));
+
+    if (chkTranslate && chkTranslate->isChecked())
+        doAutoTranslate();
 }
 
 void TranslateWindow::rebuildTable(QTableWidget* tbl, const QVector<ScreenLine>& lines)
@@ -519,6 +624,14 @@ void TranslateWindow::rebuildTable(QTableWidget* tbl, const QVector<ScreenLine>&
         setCell(COL_POS, QString("r%1").arg(e.ty), false);
         setCell(COL_TEXT, e.text, false);
         setCell(COL_TRANS, e.translation, true);
+
+        if (chkGlyph && chkGlyph->isChecked())
+        {
+            QImage img = renderLineImage(e);
+            QPixmap pm = QPixmap::fromImage(img.scaled(img.width() * 2, img.height() * 2));
+            if (auto* it = tbl->item(r, COL_TEXT))
+                it->setData(Qt::DecorationRole, pm);
+        }
     }
     updatingTable = false;
 }
@@ -784,6 +897,222 @@ void TranslateWindow::onApplyLive()
     lblStatus->setText(QString("Applied translations to screen: %1 BG line(s), %2 sprite line(s). "
                                "Static text stays; animated text may be redrawn by the game.")
                        .arg(applied).arg(obj));
+}
+
+// ---------------------------------------------------------------------------
+// automatic OCR (offline glyph matching, best-effort)
+// ---------------------------------------------------------------------------
+
+quint64 TranslateWindow::tileMask(int engineNum, int kind, int bg, int tile)
+{
+    NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
+    if (!nds) return 0;
+    GPU2D& eng = engineNum ? nds->GPU.GPU2D_B : nds->GPU.GPU2D_A;
+
+    u8* vram = nullptr; u32 mask = 0; bool bpp8 = false; u32 charBase = 0;
+    if (kind == 0)
+    {
+        u16 bgcnt = eng.BGCnt[bg]; u32 d = eng.DispCnt;
+        bpp8 = bgcnt & 0x80;
+        charBase = ((bgcnt >> 2) & 0x3) * 0x4000u + ((engineNum == 0) ? (((d >> 24) & 0x7) * 0x10000u) : 0u);
+        eng.GetBGVRAM(vram, mask);
+    }
+    else eng.GetOBJVRAM(vram, mask);
+    if (!vram || mask == 0) return 0;
+
+    u32 tb = bpp8 ? 64u : 32u;
+    u32 base = charBase + (u32)tile * tb;
+    quint64 bits = 0; int bit = 0;
+    for (int row = 0; row < 8; row++)
+        for (int col = 0; col < 8; col++)
+        {
+            int px;
+            if (bpp8) px = vram[(base + row * 8 + col) & mask];
+            else { u8 b = vram[(base + row * 4 + col / 2) & mask]; px = (col & 1) ? (b >> 4) : (b & 0x0F); }
+            if (px != 0) bits |= (1ULL << bit);
+            bit++;
+        }
+    return bits;
+}
+
+void TranslateWindow::buildOcrRef()
+{
+    if (ocrRefBuilt) return;
+
+    QFont f;
+    for (const QString& name : { QString("MS Gothic"), QString("Yu Gothic"),
+                                 QString("Meiryo"), QString("Noto Sans CJK JP") })
+        if (QFontDatabase::families().contains(name)) { f.setFamily(name); break; }
+    f.setPixelSize(8);
+
+    auto addChar = [&](QChar c)
+    {
+        QImage im(8, 8, QImage::Format_ARGB32);
+        im.fill(qRgba(255, 255, 255, 255));
+        QPainter p(&im);
+        p.setFont(f);
+        p.setPen(Qt::black);
+        p.drawText(im.rect(), Qt::AlignCenter, QString(c));
+        p.end();
+        quint64 bits = 0; int bit = 0;
+        for (int row = 0; row < 8; row++)
+            for (int col = 0; col < 8; col++)
+            {
+                if (qGray(im.pixel(col, row)) < 128) bits |= (1ULL << bit);
+                bit++;
+            }
+        ocrRef.insert(c, bits);
+    };
+
+    for (ushort c = 0x21; c <= 0x7E; c++) addChar(QChar(c));            // ASCII
+    for (ushort c = 0x3041; c <= 0x3096; c++) addChar(QChar(c));        // hiragana
+    for (ushort c = 0x30A1; c <= 0x30FA; c++) addChar(QChar(c));        // katakana
+    for (ushort c = 0xFF10; c <= 0xFF19; c++) addChar(QChar(c));        // fullwidth digits
+    ocrRefBuilt = true;
+}
+
+void TranslateWindow::onAutoOCR()
+{
+    buildOcrRef();
+
+    // collect unique (engine,kind,bg,tile) from what is on screen
+    struct Key { int e, k, b, t; };
+    QHash<int, Key> uniq; // key = compact hash
+    auto collect = [&](const QVector<ScreenLine>& lines)
+    {
+        for (const auto& ln : lines)
+            for (int t : ln.tiles)
+            {
+                int h = ((ln.engineNum & 1) << 30) | ((ln.kind & 1) << 29) | ((ln.bg & 3) << 27) | (t & 0x3FF);
+                if (!uniq.contains(h)) uniq.insert(h, { ln.engineNum, ln.kind, ln.bg, t });
+            }
+    };
+    collect(topLines); collect(botLines);
+
+    const int THRESH = 10; // max differing pixels (of 64) to accept
+    int filled = 0;
+    for (auto it = uniq.constBegin(); it != uniq.constEnd(); ++it)
+    {
+        const Key& k = it.value();
+        quint64 g = tileMask(k.e, k.k, k.b, k.t);
+        if (g == 0) continue; // blank tile
+        int best = 65; QChar bestChar;
+        for (auto r = ocrRef.constBegin(); r != ocrRef.constEnd(); ++r)
+        {
+            int d = (int)std::bitset<64>(g ^ r.value()).count();
+            if (d < best) { best = d; bestChar = r.key(); }
+        }
+        if (best <= THRESH) { Table.byCode[(u32)k.t] = QString(bestChar); filled++; }
+    }
+
+    if (filled == 0)
+    {
+        QMessageBox::information(this, "Auto-OCR",
+            "No confident matches. Game fonts often don't match a system font "
+            "(especially kanji). Use \"Teach reading\" to map the tiles by hand.");
+        return;
+    }
+    Table.loaded = true;
+    Table.buildEnc();
+    lblTable->setText(QString("table: %1").arg(Table.byCode.size()));
+    lastTopSig.clear(); lastBotSig.clear();
+    refresh(true);
+    lblStatus->setText(QString("Auto-OCR guessed %1 tile(s). Fix wrong ones with Teach.").arg(filled));
+}
+
+// ---------------------------------------------------------------------------
+// real-time online translation
+// ---------------------------------------------------------------------------
+
+void TranslateWindow::applyTranslationToRows(const QString& sig, const QString& translation)
+{
+    updatingTable = true;
+    auto upd = [&](QTableWidget* tbl, QVector<ScreenLine>& lines)
+    {
+        for (int i = 0; i < lines.size(); i++)
+            if (lines[i].sig == sig)
+            {
+                lines[i].translation = translation;
+                if (auto* it = tbl->item(i, COL_TRANS)) it->setText(translation);
+            }
+    };
+    upd(tblTop, topLines);
+    upd(tblBottom, botLines);
+    updatingTable = false;
+}
+
+void TranslateWindow::translateSig(const QString& sig, const QString& text)
+{
+    if (!net || text.trimmed().isEmpty()) return;
+    if (requestedSigs.contains(sig)) return;
+    requestedSigs.insert(sig);
+
+    QString tl = txtLang ? txtLang->text().trimmed() : "pt";
+    if (tl.isEmpty()) tl = "pt";
+
+    QUrl url("https://translate.googleapis.com/translate_a/single");
+    QUrlQuery q;
+    q.addQueryItem("client", "gtx");
+    q.addQueryItem("sl", "auto");
+    q.addQueryItem("tl", tl);
+    q.addQueryItem("dt", "t");
+    q.addQueryItem("q", text);
+    url.setQuery(q);
+
+    QNetworkRequest req(url);
+    req.setHeader(QNetworkRequest::UserAgentHeader, "Mozilla/5.0 melonDS");
+    QNetworkReply* rep = net->get(req);
+    connect(rep, &QNetworkReply::finished, this, [this, rep, sig]()
+    {
+        QString out;
+        if (rep->error() == QNetworkReply::NoError)
+        {
+            QJsonDocument doc = QJsonDocument::fromJson(rep->readAll());
+            if (doc.isArray())
+            {
+                QJsonArray segs = doc.array().at(0).toArray();
+                for (const auto& s : segs) out += s.toArray().at(0).toString();
+            }
+        }
+        rep->deleteLater();
+        if (!out.isEmpty())
+        {
+            transBySig[sig] = out;
+            applyTranslationToRows(sig, out);
+        }
+        else
+        {
+            requestedSigs.remove(sig); // allow a later retry
+        }
+    });
+}
+
+void TranslateWindow::doAutoTranslate()
+{
+    if (!Table.isLoaded()) return; // only translate real decoded text
+    auto go = [&](const QVector<ScreenLine>& lines)
+    {
+        for (const auto& ln : lines)
+            if (ln.translation.isEmpty() && !ln.text.trimmed().isEmpty())
+                translateSig(ln.sig, ln.text);
+    };
+    go(topLines); go(botLines);
+}
+
+void TranslateWindow::onTranslateNow()
+{
+    if (!Table.isLoaded())
+    { QMessageBox::information(this, "Translate",
+        "Translation works on decoded text. Load/teach a table or run Auto-OCR first."); return; }
+    doAutoTranslate();
+    lblStatus->setText("Requested online translation for the on-screen lines...");
+}
+
+void TranslateWindow::onAutoTranslateToggled(bool on)
+{
+    lblStatus->setText(on ? "Auto-translate on (online; decoded lines only)."
+                          : "Auto-translate off.");
+    if (on) doAutoTranslate();
 }
 
 // ---------------------------------------------------------------------------

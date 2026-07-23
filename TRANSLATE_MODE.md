@@ -36,11 +36,32 @@ Type your translation in the **Translation** column, then **Apply to screen
 sprite lines. Static text (menus, names) stays changed; text the game redraws
 every frame may revert.
 
-## Reading the letters (tile table)
+## Auto-OCR (best-effort)
 
-Tiles are the game's own glyph indices, so each line first appears as tile codes
-(e.g. `15c 15d 15e`). To read them as letters, make a **tile table** — a text file
-with one mapping per line:
+**Auto-OCR glyphs** tries to guess each tile's character by matching its shape to
+a system font. It works reasonably for kana and latin letters, but **kanji at 8x8
+is unreliable** and often stays as tile codes — treat OCR as a head start and fix
+the wrong guesses with **Teach reading**. No internet needed.
+
+## Real-time translation (online)
+
+Tick **Auto-translate (online)** (and set the target language, e.g. `pt`) to have
+decoded lines translated in real time by an online service; **Translate now** does
+it once on demand. Requirements and limits: needs **internet**; only works on
+lines that are already **real text** (via table / Teach / Auto-OCR), not raw tile
+codes; and it uses an unofficial endpoint that may rate-limit or change.
+
+## Seeing the actual characters
+
+The on-screen text is drawn from the game's own font, so each line first appears
+as tile codes (e.g. `15c 15d 15e`) — those numbers **are** the text, in the game's
+internal font. Two ways to read them:
+
+* **Show glyphs** (on by default) — draws each tile's real pixels next to the
+  codes, so you literally SEE the kanji/kana/latin characters as images, with no
+  table needed.
+* **Tile table** — to get them as selectable/typable letters, map tile codes to
+  characters (see below).
 
 ```
 15c=A

@@ -39,6 +39,7 @@
 #include <QHash>
 #include <QVector>
 #include <QPair>
+#include <QSet>
 
 #include "types.h"
 
@@ -50,6 +51,8 @@ class QComboBox;
 class QSpinBox;
 class QLineEdit;
 class QLabel;
+class QImage;
+class QNetworkAccessManager;
 class EmuInstance;
 
 namespace melonDS { class NDS; class GPU2D; }
@@ -118,6 +121,9 @@ private slots:
     void onApplyLive();
     void onGuide();
     void onToggleInspect(bool on);
+    void onAutoOCR();
+    void onTranslateNow();
+    void onAutoTranslateToggled(bool on);
     void onTopCellChanged(int row, int col);
     void onBottomCellChanged(int row, int col);
     void onSaveProject();
@@ -133,11 +139,17 @@ private:
     void writeTileBG(int engineNum, int bg, int dsx, int dsy, int tileIndex);
     QVector<int> encodeTiles(const QString& text);
     QString decodeLine(const QVector<int>& tiles);
+    QImage renderLineImage(const ScreenLine& ln);
     QString lineSignature(int kind, int bg, const QVector<int>& tiles);
     void rebuildTable(QTableWidget* tbl, const QVector<ScreenLine>& lines);
     void refreshPauseButton();
     void highlightBottomLine(int lineIndex);
     QTableWidget* activeTable();
+    quint64 tileMask(int engineNum, int kind, int bg, int tile);
+    void buildOcrRef();
+    void translateSig(const QString& sig, const QString& text);
+    void doAutoTranslate();
+    void applyTranslationToRows(const QString& sig, const QString& translation);
 
     EmuInstance* emuInstance = nullptr;
 
@@ -147,6 +159,9 @@ private:
     QPushButton*  btnInspect = nullptr;
     QCheckBox*    chkAuto = nullptr;
     QCheckBox*    chkHex = nullptr;
+    QCheckBox*    chkGlyph = nullptr;
+    QCheckBox*    chkTranslate = nullptr;
+    QLineEdit*    txtLang = nullptr;
     QSpinBox*     spnMinRun = nullptr;
     QLabel*       lblStatus = nullptr;
     QLabel*       lblTable = nullptr;
@@ -158,6 +173,11 @@ private:
     QHash<QString, QString> transBySig;   // persists translations across refreshes
 
     CharTable Table;
+
+    QNetworkAccessManager* net = nullptr;
+    QHash<QChar, quint64> ocrRef;
+    bool ocrRefBuilt = false;
+    QSet<QString> requestedSigs;
 
     bool inspectArmed = false;
     int  highlightedRow = -1;
