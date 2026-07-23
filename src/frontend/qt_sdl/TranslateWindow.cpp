@@ -17,220 +17,231 @@
 */
 
 #include "TranslateWindow.h"
+#include "TranslateSJIS.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
-#include <QTabWidget>
 #include <QTableWidget>
 #include <QAbstractItemView>
 #include <QHeaderView>
 #include <QPushButton>
 #include <QCheckBox>
-#include <QSpinBox>
+#include <QLineEdit>
 #include <QLabel>
 #include <QFileDialog>
 #include <QMessageBox>
-#include <QInputDialog>
 #include <QFile>
-#include <QTextStream>
+#include <QColor>
+#include <QBrush>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
-#include <QColor>
-#include <QBrush>
-#include <QImage>
-#include <QPixmap>
-#include <QIcon>
-#include <QPainter>
-#include <QFont>
-#include <QFontDatabase>
-#include <QNetworkAccessManager>
-#include <QNetworkRequest>
-#include <QNetworkReply>
-#include <QUrl>
-#include <QUrlQuery>
-#include <QStringConverter>
+#include <QHash>
 #include <vector>
-#include <unordered_map>
-#include <cstdlib>
-#include <bitset>
 #include <tuple>
 #include <cstring>
 
 #include "main.h"
 #include "EmuInstance.h"
 #include "EmuThread.h"
-#include "Window.h"
-#include "Screen.h"
 #include "NDS.h"
-#include "GPU.h"
 #include "NDSCart.h"
-#include "TranslateSJIS.h"
 
 using namespace melonDS;
 
-enum { COL_BG, COL_POS, COL_TEXT, COL_TRANS, COL_COUNT };
+// ---- cp932 (Shift-JIS) helpers using the compiled TranslateSJIS.h table ----
 
-// visible DS screen = 32x24 tiles (256x192)
-static const int kTileCols = 32;
-static const int kTileRows = 24;
+static const QHash<quint16, uint>& sjisFwd()
+{
+    static QHash<quint16, uint> m;
+    if (m.isEmpty())
+        for (int i = 0; i < kSJISTableLen; i++) m.insert(kSJISTable[i].key, kSJISTable[i].cp);
+    return m;
+}
+static const QHash<uint, quint16>& sjisRev()
+{
+    static QHash<uint, quint16> m;
+    if (m.isEmpty())
+        for (int i = 0; i < kSJISTableLen; i++)
+            if (!m.contains(kSJISTable[i].cp)) m.insert(kSJISTable[i].cp, kSJISTable[i].key);
+    return m;
+}
+
+// game bytes -> readable, editable text (0x0A -> "\n", control -> {XX})
+static QString sjisDecode(const QByteArray& raw)
+{
+    QString out; int n = raw.size();
+    for (int i = 0; i < n; )
+    {
+        u8 b = (u8)raw[i];
+        if (b == 0x0A) { out += "\\n"; i++; continue; }
+        if (b >= 0x20 && b <= 0x7E) { out += QChar((char16_t)b); i++; continue; }
+        if (b >= 0xA1 && b <= 0xDF) { out += QChar((char16_t)(0xFF61 + (b - 0xA1))); i++; continue; }
+        if (((b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC)) && i + 1 < n)
+        {
+            u8 t = (u8)raw[i + 1];
+            auto it = sjisFwd().find((quint16)((b << 8) | t));
+            if (it != sjisFwd().end()) { out += QChar((char16_t)it.value()); i += 2; continue; }
+        }
+        out += QString("{%1}").arg((int)b, 2, 16, QChar('0'));
+        i++;
+    }
+    return out;
+}
+
+static QByteArray sjisEncode(const QString& s)
+{
+    QByteArray out; int i = 0, n = s.size();
+    while (i < n)
+    {
+        QChar c = s.at(i);
+        if (c == '\\' && i + 1 < n && s.at(i + 1) == 'n') { out.append((char)0x0A); i += 2; continue; }
+        if (c == '{' && i + 3 < n && s.at(i + 3) == '}')
+        {
+            bool ok = false; int v = s.mid(i + 1, 2).toInt(&ok, 16);
+            if (ok) { out.append((char)v); i += 4; continue; }
+        }
+        uint cp = c.unicode();
+        if (cp >= 0x20 && cp <= 0x7E) { out.append((char)cp); i++; continue; }
+        if (cp >= 0xFF61 && cp <= 0xFF9F) { out.append((char)(0xA1 + (cp - 0xFF61))); i++; continue; }
+        auto it = sjisRev().find(cp);
+        if (it != sjisRev().end()) { quint16 k = it.value(); out.append((char)(k >> 8)); out.append((char)(k & 0xFF)); }
+        else out.append('?');
+        i++;
+    }
+    return out;
+}
+
+// ---- NDS filesystem parsing over a ROM buffer ----
+
+namespace {
+struct NdsFS
+{
+    const u8* d; u32 len; u32 fntOff, fatOff;
+    u16 rd16(u32 o) const { return (u32)d[o] | ((u32)d[o+1] << 8); }
+    u32 rd32(u32 o) const { return (u32)d[o] | ((u32)d[o+1]<<8) | ((u32)d[o+2]<<16) | ((u32)d[o+3]<<24); }
+};
+void fsWalk(const NdsFS& fs, u16 did, const QString& path,
+            std::vector<std::tuple<QString,u32,u32>>& out)
+{
+    u32 ent = fs.fntOff + (did & 0xFFF) * 8;
+    if (ent + 6 > fs.len) return;
+    u32 sub = fs.fntOff + fs.rd32(ent);
+    u16 fid = fs.rd16(ent + 4);
+    u32 p = sub;
+    while (p < fs.len)
+    {
+        u8 t = fs.d[p]; p++;
+        if (t == 0) break;
+        int l = t & 0x7F; bool isd = t & 0x80;
+        if (p + l > fs.len) break;
+        QString name = QString::fromLatin1((const char*)(fs.d + p), l); p += l;
+        if (isd)
+        {
+            if (p + 2 > fs.len) break;
+            u16 d2 = fs.rd16(p); p += 2;
+            fsWalk(fs, d2, path + name + "/", out);
+        }
+        else
+        {
+            u32 fa = fs.fatOff + fid * 8;
+            if (fa + 8 <= fs.len) out.push_back(std::make_tuple(path + name, fs.rd32(fa), fs.rd32(fa + 4)));
+            fid++;
+        }
+    }
+}
+} // namespace
+
+// pointer-table Shift-JIS text file: [u16 count][count u16 offsets][cp932 strings]
+static bool parsePtr(const u8* b, u32 size, QVector<QString>& outStr, QVector<QByteArray>& outRaw)
+{
+    if (size < 6) return false;
+    u32 count = (u32)b[0] | ((u32)b[1] << 8);
+    if (count == 0 || count > 8000) return false;
+    u32 base = 2 + 2 * count;
+    if (base > size) return false;
+    QVector<u32> offs;
+    for (u32 i = 0; i < count; i++)
+    {
+        u32 o = (u32)b[2 + 2*i] | ((u32)b[2 + 2*i + 1] << 8);
+        if (base + o > size) return false;
+        offs.append(o);
+    }
+    int ok = 0;
+    for (u32 i = 0; i < count; i++)
+    {
+        u32 p = base + offs[i]; u32 end = p;
+        while (end < size && b[end] != 0x00) end++;
+        QByteArray raw((const char*)(b + p), (int)(end - p));
+        int bad = 0; for (u8 c : raw) if (c < 0x20 && c != 0x0A) bad++;
+        if (bad == 0) ok++;
+        outRaw.append(raw);
+        outStr.append(sjisDecode(raw));
+    }
+    return ok >= (int)((count * 7) / 10);
+}
+
+// ---------------------------------------------------------------------------
+
+enum { COL_FILE, COL_IDX, COL_ORIG, COL_TRANS, COL_COUNT };
 
 TranslateWindow* TranslateWindow::currentDlg = nullptr;
 
 TranslateWindow::TranslateWindow(QWidget* parent) : QDialog(parent)
 {
-    setWindowTitle("Translate Mode - live on-screen text");
+    setWindowTitle("Translate Mode");
     setAttribute(Qt::WA_DeleteOnClose);
-    resize(1040, 620);
+    resize(1040, 640);
 
     emuInstance = ((MainWindow*)parent)->getEmuInstance();
-    net = new QNetworkAccessManager(this);
 
-    auto* outer = new QVBoxLayout(this);
-    auto* tabs = new QTabWidget(this);
-    outer->addWidget(tabs);
+    auto* root = new QVBoxLayout(this);
 
-    auto* liveTab = new QWidget();
-    auto* root = new QVBoxLayout(liveTab);
-
-    // ---- toolbar ----
     auto* bar = new QHBoxLayout();
-
     btnPause = new QPushButton("Pause emulation", this);
     connect(btnPause, &QPushButton::clicked, this, &TranslateWindow::onTogglePause);
     bar->addWidget(btnPause);
 
-    auto* btnRefresh = new QPushButton("Refresh now", this);
-    connect(btnRefresh, &QPushButton::clicked, this, &TranslateWindow::onRefreshNow);
-    bar->addWidget(btnRefresh);
+    auto* btnScan = new QPushButton("Scan ROM text", this);
+    connect(btnScan, &QPushButton::clicked, this, &TranslateWindow::onScan);
+    bar->addWidget(btnScan);
 
-    chkAuto = new QCheckBox("Live (auto-refresh)", this);
-    chkAuto->setChecked(true);
-    bar->addWidget(chkAuto);
+    chkHighlight = new QCheckBox("Highlight active text", this);
+    chkHighlight->setChecked(true);
+    chkHighlight->setToolTip("Highlight the strings the game is currently using "
+                             "(text loaded in RAM / on screen right now).");
+    bar->addWidget(chkHighlight);
 
-    chkHex = new QCheckBox("Show tile codes", this);
-    chkHex->setToolTip("Show raw tile numbers instead of decoded text.");
-    bar->addWidget(chkHex);
+    chkFollow = new QCheckBox("Follow", this);
+    chkFollow->setChecked(true);
+    chkFollow->setToolTip("Auto-scroll to the active text.");
+    bar->addWidget(chkFollow);
 
-    chkGlyph = new QCheckBox("Show glyphs", this);
-    chkGlyph->setChecked(true);
-    chkGlyph->setToolTip("Draw each tile's actual pixels, so you SEE the Japanese "
-                         "characters (as images) even without a table.");
-    bar->addWidget(chkGlyph);
-
-    bar->addWidget(new QLabel("Min length:", this));
-    spnMinRun = new QSpinBox(this);
-    spnMinRun->setRange(1, 20);
-    spnMinRun->setValue(2);
-    bar->addWidget(spnMinRun);
-
-    auto* btnTable = new QPushButton("Load table...", this);
-    connect(btnTable, &QPushButton::clicked, this, &TranslateWindow::onLoadTable);
-    bar->addWidget(btnTable);
-
-    auto* btnSaveTable = new QPushButton("Save table...", this);
-    connect(btnSaveTable, &QPushButton::clicked, this, &TranslateWindow::onSaveTable);
-    bar->addWidget(btnSaveTable);
-
-    auto* btnTeach = new QPushButton("Teach reading", this);
-    btnTeach->setToolTip("Select a line, click this and type what it actually says. "
-                         "It builds the tile table (tile = character) automatically.");
-    connect(btnTeach, &QPushButton::clicked, this, &TranslateWindow::onTeach);
-    bar->addWidget(btnTeach);
-
-    lblTable = new QLabel("(no table)", this);
-    bar->addWidget(lblTable);
-
-    btnInspect = new QPushButton("Inspect (click screen)", this);
-    btnInspect->setCheckable(true);
-    btnInspect->setToolTip("Arm, then click text on the bottom (touch) screen to "
-                           "highlight its line in the bottom table.");
-    connect(btnInspect, &QPushButton::toggled, this, &TranslateWindow::onToggleInspect);
-    bar->addWidget(btnInspect);
-
-    auto* btnGuide = new QPushButton("Guide", this);
-    connect(btnGuide, &QPushButton::clicked, this, &TranslateWindow::onGuide);
-    bar->addWidget(btnGuide);
-
-    bar->addStretch();
+    bar->addWidget(new QLabel("Filter:", this));
+    txtFilter = new QLineEdit(this);
+    txtFilter->setPlaceholderText("filter by text or file...");
+    connect(txtFilter, &QLineEdit::textChanged, this, &TranslateWindow::onFilterChanged);
+    bar->addWidget(txtFilter, 1);
     root->addLayout(bar);
 
-    // ---- second row: OCR + translation ----
-    auto* bar2 = new QHBoxLayout();
+    table = new QTableWidget(this);
+    table->setColumnCount(COL_COUNT);
+    table->setHorizontalHeaderLabels({ "File", "#", "Original (JP)", "Translation" });
+    table->horizontalHeader()->setSectionResizeMode(COL_ORIG, QHeaderView::Stretch);
+    table->horizontalHeader()->setSectionResizeMode(COL_TRANS, QHeaderView::Stretch);
+    table->setColumnWidth(COL_FILE, 250);
+    table->setColumnWidth(COL_IDX, 40);
+    table->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed | QAbstractItemView::AnyKeyPressed);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    connect(table, &QTableWidget::cellChanged, this, &TranslateWindow::onCellChanged);
+    root->addWidget(table);
 
-    auto* btnOCR = new QPushButton("Auto-OCR glyphs", this);
-    btnOCR->setToolTip("Best-effort: guess characters by matching each tile's shape to "
-                       "a system font (kana/latin work best; kanji is unreliable).");
-    connect(btnOCR, &QPushButton::clicked, this, &TranslateWindow::onAutoOCR);
-    bar2->addWidget(btnOCR);
-
-    chkTranslate = new QCheckBox("Auto-translate (online)", this);
-    chkTranslate->setToolTip("Translate decoded lines in real time via an online service "
-                             "(needs internet; only works on lines that are real text).");
-    connect(chkTranslate, &QCheckBox::toggled, this, &TranslateWindow::onAutoTranslateToggled);
-    bar2->addWidget(chkTranslate);
-
-    bar2->addWidget(new QLabel("to:", this));
-    txtLang = new QLineEdit("pt", this);
-    txtLang->setFixedWidth(44);
-    txtLang->setToolTip("Target language code, e.g. pt, en, es.");
-    bar2->addWidget(txtLang);
-
-    auto* btnTr = new QPushButton("Translate now", this);
-    connect(btnTr, &QPushButton::clicked, this, &TranslateWindow::onTranslateNow);
-    bar2->addWidget(btnTr);
-
-    chkOverlay = new QCheckBox("Overlay on game", this);
-    chkOverlay->setToolTip("Show the translations as a subtitle over the emulator screen.");
-    bar2->addWidget(chkOverlay);
-
-    bar2->addStretch();
-    root->addLayout(bar2);
-
-    // ---- two tables side by side ----
-    auto* tables = new QHBoxLayout();
-
-    auto makeTable = [&](const QString& title) -> QTableWidget*
-    {
-        auto* box = new QVBoxLayout();
-        auto* lbl = new QLabel(title, this);
-        lbl->setStyleSheet("font-weight: bold;");
-        box->addWidget(lbl);
-        auto* t = new QTableWidget(this);
-        t->setColumnCount(COL_COUNT);
-        t->setHorizontalHeaderLabels({ "BG", "Pos", "On-screen text", "Translation" });
-        t->horizontalHeader()->setSectionResizeMode(COL_TEXT, QHeaderView::Stretch);
-        t->horizontalHeader()->setSectionResizeMode(COL_TRANS, QHeaderView::Stretch);
-        t->setColumnWidth(COL_BG, 36);
-        t->setColumnWidth(COL_POS, 54);
-        t->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed | QAbstractItemView::AnyKeyPressed);
-        t->setSelectionBehavior(QAbstractItemView::SelectRows);
-        t->setIconSize(QSize(360, 20));
-        box->addWidget(t);
-        tables->addLayout(box);
-        return t;
-    };
-
-    tblTop = makeTable("Top screen (tela de cima)");
-    tblBottom = makeTable("Bottom screen (tela de baixo)");
-    connect(tblTop, &QTableWidget::cellChanged, this, &TranslateWindow::onTopCellChanged);
-    connect(tblBottom, &QTableWidget::cellChanged, this, &TranslateWindow::onBottomCellChanged);
-
-    root->addLayout(tables);
-
-    // ---- bottom action row ----
     auto* actions = new QHBoxLayout();
-    auto* btnApply = new QPushButton("Apply to screen (live)", this);
-    btnApply->setToolTip("Write your translations back onto the running game using the "
-                         "tile table (needs a table). Best on static text.");
+    auto* btnApply = new QPushButton("Apply to RAM (live)", this);
+    btnApply->setToolTip("Write your translations into the game's RAM now, for an "
+                         "instant on-screen preview of the active text.");
     connect(btnApply, &QPushButton::clicked, this, &TranslateWindow::onApplyLive);
     actions->addWidget(btnApply);
-    auto* btnExport = new QPushButton("Export .txt", this);
-    connect(btnExport, &QPushButton::clicked, this, &TranslateWindow::onExportTxt);
-    actions->addWidget(btnExport);
-    auto* btnImport = new QPushButton("Import .txt", this);
-    connect(btnImport, &QPushButton::clicked, this, &TranslateWindow::onImportTxt);
-    actions->addWidget(btnImport);
     auto* btnLoad = new QPushButton("Load project", this);
     connect(btnLoad, &QPushButton::clicked, this, &TranslateWindow::onLoadProject);
     actions->addWidget(btnLoad);
@@ -238,569 +249,199 @@ TranslateWindow::TranslateWindow(QWidget* parent) : QDialog(parent)
     connect(btnSave, &QPushButton::clicked, this, &TranslateWindow::onSaveProject);
     actions->addWidget(btnSave);
     actions->addStretch();
+    auto* btnRom = new QPushButton("Create translated ROM...", this);
+    btnRom->setStyleSheet("font-weight: bold;");
+    connect(btnRom, &QPushButton::clicked, this, &TranslateWindow::onCreateRom);
+    actions->addWidget(btnRom);
     root->addLayout(actions);
 
-    lblStatus = new QLabel("Live view. Start a game - the on-screen text appears here.", this);
+    lblStatus = new QLabel("Load a game, then press \"Scan ROM text\".", this);
     root->addWidget(lblStatus);
 
-    tabs->addTab(liveTab, "On-screen (live)");
-
-    // ---- ROM text tab ----
-    auto* romTab = new QWidget();
-    auto* rroot = new QVBoxLayout(romTab);
-    auto* rbar = new QHBoxLayout();
-    auto* btnRomScan = new QPushButton("Scan ROM text", this);
-    connect(btnRomScan, &QPushButton::clicked, this, &TranslateWindow::onRomScan);
-    rbar->addWidget(btnRomScan);
-    rbar->addWidget(new QLabel("Filter:", this));
-    romFilter = new QLineEdit(this);
-    romFilter->setPlaceholderText("filter by text or file...");
-    connect(romFilter, &QLineEdit::textChanged, this, &TranslateWindow::onRomFilterChanged);
-    rbar->addWidget(romFilter, 1);
-    rroot->addLayout(rbar);
-
-    romTable = new QTableWidget(this);
-    romTable->setColumnCount(4);
-    romTable->setHorizontalHeaderLabels({ "File", "#", "Original (JP)", "Translation" });
-    romTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
-    romTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
-    romTable->setColumnWidth(0, 250);
-    romTable->setColumnWidth(1, 38);
-    romTable->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed | QAbstractItemView::AnyKeyPressed);
-    connect(romTable, &QTableWidget::cellChanged, this, &TranslateWindow::onRomCellChanged);
-    rroot->addWidget(romTable);
-
-    auto* ractions = new QHBoxLayout();
-    auto* rbtnLoad = new QPushButton("Load project", this);
-    connect(rbtnLoad, &QPushButton::clicked, this, &TranslateWindow::onRomLoadProject);
-    ractions->addWidget(rbtnLoad);
-    auto* rbtnSave = new QPushButton("Save project", this);
-    connect(rbtnSave, &QPushButton::clicked, this, &TranslateWindow::onRomSaveProject);
-    ractions->addWidget(rbtnSave);
-    ractions->addStretch();
-    auto* rbtnRom = new QPushButton("Create translated ROM...", this);
-    rbtnRom->setStyleSheet("font-weight: bold;");
-    connect(rbtnRom, &QPushButton::clicked, this, &TranslateWindow::onRomCreateRom);
-    ractions->addWidget(rbtnRom);
-    rroot->addLayout(ractions);
-
-    romStatus = new QLabel("Load a game, then press \"Scan ROM text\" to translate the real game text.", this);
-    rroot->addWidget(romStatus);
-
-    tabs->addTab(romTab, "ROM text");
-
-    refreshTimer = new QTimer(this);
-    refreshTimer->setInterval(300);
-    connect(refreshTimer, &QTimer::timeout, this, &TranslateWindow::onTick);
-    refreshTimer->start();
+    timer = new QTimer(this);
+    timer->setInterval(400);
+    connect(timer, &QTimer::timeout, this, &TranslateWindow::onTick);
+    timer->start();
 
     refreshPauseButton();
 }
 
-TranslateWindow::~TranslateWindow()
-{
-    TranslateWindow::closeDlg();
-}
+TranslateWindow::~TranslateWindow() { TranslateWindow::closeDlg(); }
 
-// ---------------------------------------------------------------------------
-// tilemap reading
-// ---------------------------------------------------------------------------
-
-int TranslateWindow::readTileIndex(GPU2D& eng, bool engineA, int bg, int dsx, int dsy)
-{
-    u16 bgcnt = eng.BGCnt[bg];
-    u32 dispcnt = eng.DispCnt;
-    u32 screenBaseOfs = engineA ? (((dispcnt >> 27) & 0x7) * 0x10000u) : 0u;
-    u32 mapBase = (((bgcnt >> 8) & 0x1F) * 0x800u) + screenBaseOfs;
-    int scsize = (bgcnt >> 14) & 0x3;
-    int mapW = (scsize == 1 || scsize == 3) ? 512 : 256;
-    int mapH = (scsize == 2 || scsize == 3) ? 512 : 256;
-
-    u8* vram = nullptr; u32 mask = 0;
-    eng.GetBGVRAM(vram, mask);
-    if (!vram || mask == 0) return -1;
-
-    int mx = (dsx + eng.BGXPos[bg]) & (mapW - 1);
-    int my = (dsy + eng.BGYPos[bg]) & (mapH - 1);
-    int ctx = mx / 8, cty = my / 8;
-    int scx = ctx >> 5, scy = cty >> 5, scIndex = 0;
-    if (mapW == 512 && mapH == 512) scIndex = scx + scy * 2;
-    else if (mapW == 512)           scIndex = scx;
-    else if (mapH == 512)           scIndex = scy;
-
-    u32 addr = mapBase + scIndex * 0x800u + (((cty & 31) * 32 + (ctx & 31)) * 2);
-    u16 ent = (u16)(vram[addr & mask] | (vram[(addr + 1) & mask] << 8));
-    return ent & 0x3FF;
-}
-
-// A tile "looks like text" if it is drawn in very few colours (font glyphs are
-// mono: 1 ink colour, maybe an outline) with a sane ink density. Background art
-// and gradients use many colours / are solid, so they are rejected. This is what
-// separates real dialogue/HUD text from decorative graphics.
-bool TranslateWindow::isTextTile(int engineNum, int kind, int bg, int tile)
+const u8* TranslateWindow::romData(u32& len)
 {
     NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
-    if (!nds) return false;
-    GPU2D& eng = engineNum ? nds->GPU.GPU2D_B : nds->GPU.GPU2D_A;
-
-    u8* vram = nullptr; u32 mask = 0; bool bpp8 = false; u32 charBase = 0;
-    if (kind == 0)
-    {
-        u16 bgcnt = eng.BGCnt[bg]; u32 d = eng.DispCnt;
-        bpp8 = bgcnt & 0x80;
-        charBase = ((bgcnt >> 2) & 0x3) * 0x4000u + ((engineNum == 0) ? (((d >> 24) & 0x7) * 0x10000u) : 0u);
-        eng.GetBGVRAM(vram, mask);
-    }
-    else eng.GetOBJVRAM(vram, mask);
-    if (!vram || mask == 0) return false;
-
-    u32 tb = bpp8 ? 64u : 32u;
-    u32 base = charBase + (u32)tile * tb;
-    int ink = 0;
-    int colors[8]; int nc = 0; // distinct non-zero colour values (capped)
-    for (int p = 0; p < 64; p++)
-    {
-        int v;
-        if (bpp8) v = vram[(base + p) & mask];
-        else { u8 b = vram[(base + (p >> 1)) & mask]; v = (p & 1) ? (b >> 4) : (b & 0x0F); }
-        if (v == 0) continue;
-        ink++;
-        bool seen = false;
-        for (int i = 0; i < nc; i++) if (colors[i] == v) { seen = true; break; }
-        if (!seen && nc < 8) colors[nc++] = v;
-    }
-    if (ink < 3) return false;                 // basically empty
-    if (ink > 46) return false;                // ~72% filled -> solid/background
-    if (nc > 3) return false;                  // many colours -> art, not text
-    return true;
+    if (!nds) return nullptr;
+    NDSCart::CartCommon* cart = nds->GetNDSCart();
+    if (!cart) return nullptr;
+    len = cart->GetROMLength();
+    return cart->GetROM();
 }
 
-// which BGs are readable as text for a given engine
-static bool isTextBg(u32 dispcnt, int bg)
+// ---------------------------------------------------------------------------
+// scan ROM text
+// ---------------------------------------------------------------------------
+
+void TranslateWindow::onScan()
 {
-    int mode = dispcnt & 0x7;
-    switch (bg)
+    u32 len = 0; const u8* d = romData(len);
+    if (!d || len < 0x200) { QMessageBox::warning(this, "Translate Mode", "No cartridge ROM loaded."); return; }
+
+    NdsFS fs; fs.d = d; fs.len = len;
+    fs.fntOff = fs.rd32(0x40); fs.fatOff = fs.rd32(0x48);
+    if (fs.fntOff + 8 > len || fs.fatOff + 8 > len)
+    { QMessageBox::warning(this, "Translate Mode", "Could not read the ROM filesystem."); return; }
+
+    std::vector<std::tuple<QString,u32,u32>> files;
+    fsWalk(fs, 0xF000, "", files);
+
+    Files.clear();
+    int total = 0;
+    for (auto& f : files)
     {
-    case 0: return !(dispcnt & (1 << 3));  // BG0 unless it's the 3D layer
-    case 1: return true;
-    case 2: return mode == 0 || mode == 1 || mode == 3;
-    case 3: return mode == 0 || mode == 2 || mode == 4 || mode == 5;
+        QString path = std::get<0>(f); u32 s = std::get<1>(f), e = std::get<2>(f);
+        if (e <= s || e > len) continue;
+        QVector<QString> strs; QVector<QByteArray> raws;
+        if (!parsePtr(d + s, e - s, strs, raws)) continue;
+        RomTextFile rt;
+        rt.path = path; rt.start = s; rt.end = e;
+        rt.originals = strs; rt.raws = raws;
+        rt.translations = QVector<QString>(strs.size());
+        rt.active = QVector<char>(strs.size(), 0);
+        rt.ramAddr = QVector<u32>(strs.size(), 0);
+        Files.push_back(rt);
+        total += strs.size();
     }
-    return false;
+    buildPrefixIndex();
+    rebuildTable();
+    lblStatus->setText(QString("Found %1 text file(s), %2 string(s). Play the game - text in use is highlighted.")
+                       .arg((int)Files.size()).arg(total));
 }
 
-void TranslateWindow::readScreen(GPU2D& eng, bool engineA, QVector<ScreenLine>& out)
+void TranslateWindow::buildPrefixIndex()
 {
-    out.clear();
-    if (eng.ForcedBlank) return;
-    u32 dispcnt = eng.DispCnt;
-    const int minRun = spnMinRun->value();
-
-    for (int bg = 0; bg < 4; bg++)
-    {
-        if (!(eng.LayerEnable & (1 << bg))) continue;
-        if (!isTextBg(dispcnt, bg)) continue;
-
-        // read the visible tile grid + classify each tile as text-like or not
-        int engineNum = engineA ? 0 : 1;
-        std::vector<std::vector<int>> grid(kTileRows, std::vector<int>(kTileCols, 0));
-        std::vector<std::vector<char>> isText(kTileRows, std::vector<char>(kTileCols, 0));
-        std::unordered_map<int, char> textCache;
-        for (int vy = 0; vy < kTileRows; vy++)
-            for (int vx = 0; vx < kTileCols; vx++)
-            {
-                int t = readTileIndex(eng, engineA, bg, vx * 8, vy * 8);
-                if (t < 0) t = 0;
-                grid[vy][vx] = t;
-                auto ci = textCache.find(t);
-                if (ci == textCache.end())
-                {
-                    char tv = isTextTile(engineNum, 0, bg, t) ? 1 : 0;
-                    textCache[t] = tv;
-                    isText[vy][vx] = tv;
-                }
-                else isText[vy][vx] = ci->second;
-            }
-
-        // group each row into runs of consecutive text tiles only
-        for (int vy = 0; vy < kTileRows; vy++)
+    Prefix.clear();
+    for (int fi = 0; fi < (int)Files.size(); fi++)
+        for (int si = 0; si < Files[fi].raws.size(); si++)
         {
-            int vx = 0;
-            while (vx < kTileCols)
+            const QByteArray& r = Files[fi].raws[si];
+            if (r.size() < 4) continue;
+            quint32 key = (quint32)((u8)r[0]) | ((quint32)((u8)r[1]) << 8)
+                        | ((quint32)((u8)r[2]) << 16) | ((quint32)((u8)r[3]) << 24);
+            Prefix.insert(key, qMakePair(fi, si));
+        }
+}
+
+// ---------------------------------------------------------------------------
+// live: which strings are currently in RAM (being used by the game)
+// ---------------------------------------------------------------------------
+
+void TranslateWindow::scanActive()
+{
+    NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
+    if (!nds || !nds->MainRAM || Files.empty() || Prefix.isEmpty()) return;
+    EmuThread* thread = emuInstance->getEmuThread();
+    if (thread && !thread->emuIsActive()) return;
+
+    const u8* ram = nds->MainRAM;
+    const u32 size = nds->MainRAMMask; // scan [0, size)
+    // clear
+    for (auto& f : Files) for (int i = 0; i < f.active.size(); i++) f.active[i] = 0;
+
+    for (u32 i = 0; i + 4 < size; i++)
+    {
+        quint32 key = (quint32)ram[i] | ((quint32)ram[i+1] << 8)
+                    | ((quint32)ram[i+2] << 16) | ((quint32)ram[i+3] << 24);
+        auto range = Prefix.equal_range(key);
+        for (auto it = range.first; it != range.second; ++it)
+        {
+            int fi = it->first, si = it->second;
+            const QByteArray& r = Files[fi].raws[si];
+            int rl = r.size();
+            if (rl < 4 || i + (u32)rl > size) continue;
+            if (memcmp(ram + i, r.constData(), rl) == 0)
             {
-                if (!isText[vy][vx]) { vx++; continue; }
-                int s = vx;
-                QVector<int> tiles;
-                while (vx < kTileCols && isText[vy][vx]) { tiles.append(grid[vy][vx]); vx++; }
-                // reject a run that is one tile repeated (flat fill, not text)
-                bool varied = false;
-                for (int q = 1; q < tiles.size(); q++) if (tiles[q] != tiles[0]) { varied = true; break; }
-                if (tiles.size() >= minRun && varied)
-                {
-                    ScreenLine ln;
-                    ln.kind = 0; ln.engineNum = engineNum;
-                    ln.bg = bg; ln.ty = vy; ln.c0 = s; ln.c1 = vx - 1;
-                    ln.tiles = tiles;
-                    ln.sig = lineSignature(0, bg, tiles);
-                    ln.text = decodeLine(tiles);
-                    ln.translation = transBySig.value(ln.sig);
-                    out.append(ln);
-                }
+                Files[fi].active[si] = 1;
+                Files[fi].ramAddr[si] = i;
             }
         }
     }
 }
-
-QString TranslateWindow::lineSignature(int kind, int bg, const QVector<int>& tiles)
-{
-    QString s = QString::number(kind) + "/" + QString::number(bg) + ":";
-    for (int t : tiles) s += QString::number(t) + ",";
-    return s;
-}
-
-QString TranslateWindow::decodeLine(const QVector<int>& tiles)
-{
-    if (!chkHex->isChecked() && Table.isLoaded())
-    {
-        QString s;
-        for (int t : tiles)
-        {
-            auto it = Table.byCode.find((u32)t);
-            s += (it != Table.byCode.end()) ? it.value() : QString(QChar(char16_t(0x00B7)));
-        }
-        return s;
-    }
-    // raw tile codes
-    QString s;
-    for (int t : tiles) s += QString("%1 ").arg(t, 3, 16, QChar('0'));
-    return s.trimmed();
-}
-
-// Draw the actual pixels of each tile so the user SEES the glyphs (monochrome:
-// ink = any non-zero pixel). Works without a table. Fully bounds-checked.
-QImage TranslateWindow::renderLineImage(const ScreenLine& ln)
-{
-    NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
-    int n = ln.tiles.size();
-    QImage img(qMax(1, n * 8), 8, QImage::Format_ARGB32);
-    img.fill(qRgba(255, 255, 255, 255));
-    if (!nds || n == 0) return img;
-
-    GPU2D& eng = ln.engineNum ? nds->GPU.GPU2D_B : nds->GPU.GPU2D_A;
-
-    u8* vram = nullptr; u32 mask = 0;
-    bool bpp8 = false;
-    u32 charBase = 0;
-    if (ln.kind == 0)
-    {
-        u16 bgcnt = eng.BGCnt[ln.bg];
-        u32 dispcnt = eng.DispCnt;
-        bpp8 = bgcnt & 0x80;
-        charBase = ((bgcnt >> 2) & 0x3) * 0x4000u
-                 + ((ln.engineNum == 0) ? (((dispcnt >> 24) & 0x7) * 0x10000u) : 0u);
-        eng.GetBGVRAM(vram, mask);
-    }
-    else
-    {
-        bpp8 = false; // OBJ text is almost always 4bpp
-        charBase = 0;
-        eng.GetOBJVRAM(vram, mask);
-    }
-    if (!vram || mask == 0) return img;
-
-    const u32 tileBytes = bpp8 ? 64u : 32u;
-    for (int t = 0; t < n; t++)
-    {
-        u32 base = charBase + (u32)ln.tiles[t] * tileBytes;
-        for (int row = 0; row < 8; row++)
-            for (int col = 0; col < 8; col++)
-            {
-                int px;
-                if (bpp8)
-                    px = vram[(base + row * 8 + col) & mask];
-                else
-                {
-                    u8 b = vram[(base + row * 4 + col / 2) & mask];
-                    px = (col & 1) ? (b >> 4) : (b & 0x0F);
-                }
-                if (px != 0)
-                    img.setPixel(t * 8 + col, row, qRgba(0, 0, 0, 255));
-            }
-    }
-    return img;
-}
-
-// ---------------------------------------------------------------------------
-// sprites (OBJ)
-// ---------------------------------------------------------------------------
-
-void TranslateWindow::readSprites(GPU2D& eng, int engineNum, QVector<ScreenLine>& out)
-{
-    (void)eng;
-    NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
-    if (!nds) return;
-    const u8* oam = &nds->GPU.OAM[engineNum ? 0x400 : 0];
-
-    struct Spr { int x, y, tile, idx; };
-    std::vector<Spr> sprs;
-    for (int i = 0; i < 128; i++)
-    {
-        const u8* e = oam + i * 8;
-        u16 a0 = (u16)(e[0] | (e[1] << 8));
-        u16 a1 = (u16)(e[2] | (e[3] << 8));
-        u16 a2 = (u16)(e[4] | (e[5] << 8));
-        bool rotscale = a0 & 0x0100;
-        if (!rotscale && (a0 & 0x0200)) continue;   // hidden sprite
-        int y = a0 & 0xFF;
-        int x = a1 & 0x1FF; if (x & 0x100) x -= 0x200;
-        if (y >= 192 || x <= -32 || x >= 256) continue;
-        int tile = a2 & 0x3FF;
-        if (!isTextTile(engineNum, 1, 0, tile)) continue;   // only glyph-like sprites
-        sprs.push_back({ x, y, tile, i });
-    }
-    if (sprs.empty()) return;
-
-    std::sort(sprs.begin(), sprs.end(), [](const Spr& a, const Spr& b)
-              { return (a.y != b.y) ? a.y < b.y : a.x < b.x; });
-
-    const int minRun = spnMinRun->value();
-    size_t k = 0;
-    while (k < sprs.size())
-    {
-        int rowY = sprs[k].y;
-        QVector<int> tiles; QVector<int> oamIdx;
-        int lastX = sprs[k].x - 8;
-        int c0 = sprs[k].x / 8;
-        while (k < sprs.size() && std::abs(sprs[k].y - rowY) <= 4 && (sprs[k].x - lastX) <= 24)
-        {
-            tiles.append(sprs[k].tile);
-            oamIdx.append(sprs[k].idx);
-            lastX = sprs[k].x;
-            k++;
-        }
-        if (tiles.size() >= minRun)
-        {
-            ScreenLine ln;
-            ln.kind = 1; ln.engineNum = engineNum;
-            ln.ty = rowY / 8; ln.c0 = c0; ln.c1 = lastX / 8;
-            ln.tiles = tiles; ln.oam = oamIdx;
-            ln.sig = lineSignature(1, engineNum, tiles);
-            ln.text = decodeLine(tiles);
-            ln.translation = transBySig.value(ln.sig);
-            out.append(ln);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// table encode + tile writing (direct/live translation editing)
-// ---------------------------------------------------------------------------
-
-void CharTable::buildEnc()
-{
-    enc.clear();
-    for (auto it = byCode.constBegin(); it != byCode.constEnd(); ++it)
-        if (!it.value().isEmpty())
-            enc.append({ it.value(), it.key() });
-    std::sort(enc.begin(), enc.end(),
-              [](const QPair<QString, melonDS::u32>& a, const QPair<QString, melonDS::u32>& b)
-              { return a.first.size() > b.first.size(); });
-}
-
-QVector<int> TranslateWindow::encodeTiles(const QString& text)
-{
-    QVector<int> out;
-    int pos = 0;
-    while (pos < text.size())
-    {
-        bool matched = false;
-        for (const auto& p : Table.enc)
-        {
-            if (!p.first.isEmpty() && text.mid(pos, p.first.size()) == p.first)
-            {
-                out.append((int)p.second);
-                pos += p.first.size();
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) { out.append(-1); pos++; } // unknown char
-    }
-    return out;
-}
-
-void TranslateWindow::writeTileBG(int engineNum, int bg, int dsx, int dsy, int tileIndex)
-{
-    NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
-    if (!nds) return;
-    GPU2D& eng = engineNum ? nds->GPU.GPU2D_B : nds->GPU.GPU2D_A;
-
-    u16 bgcnt = eng.BGCnt[bg];
-    u32 dispcnt = eng.DispCnt;
-    u32 screenBaseOfs = (engineNum == 0) ? (((dispcnt >> 27) & 0x7) * 0x10000u) : 0u;
-    u32 mapBase = (((bgcnt >> 8) & 0x1F) * 0x800u) + screenBaseOfs;
-    int scsize = (bgcnt >> 14) & 0x3;
-    int mapW = (scsize == 1 || scsize == 3) ? 512 : 256;
-    int mapH = (scsize == 2 || scsize == 3) ? 512 : 256;
-
-    int mx = (dsx + eng.BGXPos[bg]) & (mapW - 1);
-    int my = (dsy + eng.BGYPos[bg]) & (mapH - 1);
-    int ctx = mx / 8, cty = my / 8;
-    int scx = ctx >> 5, scy = cty >> 5, scIndex = 0;
-    if (mapW == 512 && mapH == 512) scIndex = scx + scy * 2;
-    else if (mapW == 512)           scIndex = scx;
-    else if (mapH == 512)           scIndex = scy;
-    u32 addr = mapBase + scIndex * 0x800u + (((cty & 31) * 32 + (ctx & 31)) * 2);
-
-    u8* vram = nullptr; u32 mask = 0;
-    eng.GetBGVRAM(vram, mask);
-    if (!vram || mask == 0) return;
-    u16 cur = (u16)(vram[addr & mask] | (vram[(addr + 1) & mask] << 8));
-    u16 ent = (u16)((cur & 0xFC00) | (tileIndex & 0x3FF)); // keep palette/flip bits
-
-    if (engineNum == 0) nds->GPU.WriteVRAM_ABG<u16>(addr & 0x7FFFF, ent);
-    else                nds->GPU.WriteVRAM_BBG<u16>(addr & 0x1FFFF, ent);
-}
-
-// ---------------------------------------------------------------------------
-// refresh
-// ---------------------------------------------------------------------------
 
 void TranslateWindow::onTick()
 {
     refreshPauseButton();
-    if (chkAuto->isChecked())
-        refresh(false);
+    if (!chkHighlight->isChecked() || Files.empty()) return;
+
+    scanActive();
+
+    // recolour rows + optionally scroll to the first active row
+    updatingTable = true;
+    QColor hi(120, 220, 120);
+    int firstActive = -1;
+    for (int r = 0; r < Rows.size(); r++)
+    {
+        int fi = Rows[r].first, si = Rows[r].second;
+        bool on = Files[fi].active[si];
+        for (int c = 0; c < COL_COUNT; c++)
+            if (auto* it = table->item(r, c)) it->setBackground(on ? QBrush(hi) : QBrush());
+        if (on && firstActive < 0) firstActive = r;
+    }
+    updatingTable = false;
+
+    if (firstActive >= 0 && chkFollow->isChecked())
+        if (auto* it = table->item(firstActive, COL_ORIG))
+            table->scrollToItem(it, QAbstractItemView::PositionAtCenter);
 }
 
-void TranslateWindow::onRefreshNow() { refresh(true); }
+// ---------------------------------------------------------------------------
+// table
+// ---------------------------------------------------------------------------
 
-void TranslateWindow::refresh(bool force)
-{
-    NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
-    if (!nds) return;
-    EmuThread* thread = emuInstance->getEmuThread();
-    if (thread && !thread->emuIsActive()) return;
-
-    // engine -> screen mapping (POWCNT screen swap)
-    bool swap = nds->GPU.ScreenSwap;
-    GPU2D& topEng = swap ? nds->GPU.GPU2D_A : nds->GPU.GPU2D_B;
-    GPU2D& botEng = swap ? nds->GPU.GPU2D_B : nds->GPU.GPU2D_A;
-
-    QVector<ScreenLine> nt, nb;
-    readScreen(topEng, &topEng == &nds->GPU.GPU2D_A, nt);
-    readSprites(topEng, (&topEng == &nds->GPU.GPU2D_A) ? 0 : 1, nt);
-    readScreen(botEng, &botEng == &nds->GPU.GPU2D_A, nb);
-    readSprites(botEng, (&botEng == &nds->GPU.GPU2D_A) ? 0 : 1, nb);
-
-    auto sigOf = [](const QVector<ScreenLine>& v) {
-        QString s; for (auto& l : v) s += l.sig + "|"; return s;
-    };
-    QString ts = sigOf(nt), bs = sigOf(nb);
-
-    if (force || ts != lastTopSig)
-    {
-        topLines = nt; lastTopSig = ts;
-        rebuildTable(tblTop, topLines);
-    }
-    if (force || bs != lastBotSig)
-    {
-        botLines = nb; lastBotSig = bs;
-        highlightedRow = -1;
-        rebuildTable(tblBottom, botLines);
-    }
-
-    lblStatus->setText(QString("On screen now - top: %1 line(s), bottom: %2 line(s)%3")
-                       .arg(topLines.size()).arg(botLines.size())
-                       .arg(Table.isLoaded() ? "" : "   (load a tile .tbl to read letters)"));
-
-    if (chkTranslate && chkTranslate->isChecked())
-        doAutoTranslate();
-
-    // push the translation subtitle overlay onto the game screen
-    if (chkOverlay)
-    {
-        QString ov;
-        if (chkOverlay->isChecked())
-        {
-            // the OSD font is ASCII-only, so approximate accents (tradução -> traducao)
-            auto ascii = [](QString s)
-            {
-                s = s.normalized(QString::NormalizationForm_KD);
-                QString o;
-                for (QChar c : s)
-                {
-                    if (c.category() == QChar::Mark_NonSpacing) continue;
-                    ushort u = c.unicode();
-                    o += (u >= 0x20 && u <= 0x7E) ? c : QChar('?');
-                }
-                return o;
-            };
-            int lines = 0;
-            auto add = [&](const QVector<ScreenLine>& v)
-            {
-                for (const auto& l : v)
-                    if (!l.translation.isEmpty() && lines < 4)
-                    { ov += (ov.isEmpty() ? QString() : QString(" / ")) + ascii(l.translation); lines++; }
-            };
-            add(topLines); add(botLines);
-        }
-        MainWindow* mw = emuInstance ? emuInstance->getMainWindow() : nullptr;
-        if (mw && mw->panel) mw->panel->setTransOverlay(ov);
-    }
-}
-
-void TranslateWindow::rebuildTable(QTableWidget* tbl, const QVector<ScreenLine>& lines)
+void TranslateWindow::rebuildTable()
 {
     updatingTable = true;
-    tbl->setRowCount(lines.size());
-    for (int r = 0; r < lines.size(); r++)
+    Rows.clear();
+    RowOf.clear();
+    QString filter = txtFilter->text();
+    for (int fi = 0; fi < (int)Files.size(); fi++)
+        for (int si = 0; si < Files[fi].originals.size(); si++)
+        {
+            if (!filter.isEmpty() &&
+                !Files[fi].originals[si].contains(filter, Qt::CaseInsensitive) &&
+                !Files[fi].path.contains(filter, Qt::CaseInsensitive) &&
+                !Files[fi].translations[si].contains(filter, Qt::CaseInsensitive))
+                continue;
+            Rows.append(qMakePair(fi, si));
+        }
+    table->setRowCount(Rows.size());
+    for (int r = 0; r < Rows.size(); r++)
     {
-        const ScreenLine& e = lines[r];
-        auto setCell = [&](int col, const QString& txt, bool editable)
+        int fi = Rows[r].first, si = Rows[r].second;
+        RowOf.insert(fi * 100000 + si, r);
+        auto setCell = [&](int col, const QString& txt, bool ed)
         {
             QTableWidgetItem* it = new QTableWidgetItem(txt);
-            it->setData(Qt::UserRole, r);
-            if (editable) it->setFlags(it->flags() | Qt::ItemIsEditable);
-            else          it->setFlags(it->flags() & ~Qt::ItemIsEditable);
-            tbl->setItem(r, col, it);
+            if (ed) it->setFlags(it->flags() | Qt::ItemIsEditable);
+            else    it->setFlags(it->flags() & ~Qt::ItemIsEditable);
+            table->setItem(r, col, it);
         };
-        setCell(COL_BG, e.kind == 1 ? QString("OBJ") : QString("BG%1").arg(e.bg), false);
-        setCell(COL_POS, QString("r%1").arg(e.ty), false);
-        setCell(COL_TEXT, e.text, false);
-        setCell(COL_TRANS, e.translation, true);
-
-        if (chkGlyph && chkGlyph->isChecked())
-        {
-            QImage img = renderLineImage(e);
-            QPixmap pm = QPixmap::fromImage(img.scaled(img.width() * 2, img.height() * 2));
-            if (auto* it = tbl->item(r, COL_TEXT))
-                it->setData(Qt::DecorationRole, pm);
-        }
+        setCell(COL_FILE, Files[fi].path, false);
+        setCell(COL_IDX, QString::number(si), false);
+        setCell(COL_ORIG, Files[fi].originals[si], false);
+        setCell(COL_TRANS, Files[fi].translations[si], true);
     }
     updatingTable = false;
 }
 
-// ---------------------------------------------------------------------------
-// editing / persistence
-// ---------------------------------------------------------------------------
+void TranslateWindow::onFilterChanged(const QString&) { rebuildTable(); }
 
-void TranslateWindow::onTopCellChanged(int row, int col)
+void TranslateWindow::onCellChanged(int row, int col)
 {
     if (updatingTable || col != COL_TRANS) return;
-    if (row < 0 || row >= topLines.size()) return;
-    QString txt = tblTop->item(row, col)->text();
-    topLines[row].translation = txt;
-    transBySig[topLines[row].sig] = txt;
-}
-
-void TranslateWindow::onBottomCellChanged(int row, int col)
-{
-    if (updatingTable || col != COL_TRANS) return;
-    if (row < 0 || row >= botLines.size()) return;
-    QString txt = tblBottom->item(row, col)->text();
-    botLines[row].translation = txt;
-    transBySig[botLines[row].sig] = txt;
+    if (row < 0 || row >= Rows.size()) return;
+    int fi = Rows[row].first, si = Rows[row].second;
+    Files[fi].translations[si] = table->item(row, col)->text();
 }
 
 // ---------------------------------------------------------------------------
@@ -826,797 +467,48 @@ void TranslateWindow::onTogglePause()
     if (!thread || !thread->emuIsActive()) return;
     thread->emuTogglePause();
     refreshPauseButton();
-    refresh(true);
 }
 
 // ---------------------------------------------------------------------------
-// inspect (click screen -> highlight matching bottom line)
+// apply to RAM (live preview)
 // ---------------------------------------------------------------------------
-
-void TranslateWindow::onToggleInspect(bool on)
-{
-    inspectArmed = on;
-    lblStatus->setText(on
-        ? "Inspect armed: click the text on the bottom (touch) screen."
-        : "Inspect off.");
-}
-
-void TranslateWindow::highlightBottomLine(int lineIndex)
-{
-    updatingTable = true;
-    if (highlightedRow >= 0 && highlightedRow < tblBottom->rowCount())
-        for (int c = 0; c < tblBottom->columnCount(); c++)
-            if (auto* it = tblBottom->item(highlightedRow, c)) it->setBackground(QBrush());
-    highlightedRow = lineIndex;
-    if (lineIndex >= 0 && lineIndex < tblBottom->rowCount())
-    {
-        QColor hi(120, 220, 120);
-        for (int c = 0; c < tblBottom->columnCount(); c++)
-            if (auto* it = tblBottom->item(lineIndex, c)) it->setBackground(hi);
-        if (auto* it = tblBottom->item(lineIndex, COL_TEXT))
-            tblBottom->scrollToItem(it, QAbstractItemView::PositionAtCenter);
-    }
-    updatingTable = false;
-}
-
-void TranslateWindow::screenPick(int dsx, int dsy)
-{
-    // make sure the bottom table matches the current frame
-    refresh(true);
-
-    int ptx = dsx / 8, pty = dsy / 8;
-    int found = -1;
-    // prefer the last (usually front-most) matching line
-    for (int i = 0; i < botLines.size(); i++)
-    {
-        const ScreenLine& l = botLines[i];
-        if (l.ty == pty && ptx >= l.c0 && ptx <= l.c1)
-            found = i;
-    }
-
-    if (found < 0)
-    {
-        lblStatus->setText(QString("Inspect: no text line at bottom-screen tile (col %1, row %2).")
-                           .arg(ptx).arg(pty));
-        return;
-    }
-    highlightBottomLine(found);
-    tblBottom->selectRow(found);
-    lblStatus->setText(QString("Inspect: selected bottom line at row %1 (BG%2).")
-                       .arg(pty).arg(botLines[found].bg));
-}
-
-// ---------------------------------------------------------------------------
-// tile table (.tbl)
-// ---------------------------------------------------------------------------
-
-void TranslateWindow::onLoadTable()
-{
-    QString fn = QFileDialog::getOpenFileName(this, "Load tile/character table",
-                                              "", "Table (*.tbl *.txt);;All files (*)");
-    if (fn.isEmpty()) return;
-    QFile f(fn);
-    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
-    { QMessageBox::critical(this, "Translate Mode", "Could not open the table file."); return; }
-
-    Table.clear();
-    QTextStream in(&f);
-    in.setEncoding(QStringConverter::Utf8);
-    int n = 0;
-    while (!in.atEnd())
-    {
-        QString line = in.readLine();
-        if (line.isEmpty() || line.startsWith(';') || line.startsWith('#')) continue;
-        int eq = line.indexOf('=');
-        if (eq <= 0) continue;
-        QString hex = line.left(eq).trimmed();
-        QString val = line.mid(eq + 1);
-        bool ok = false;
-        u32 code = hex.toUInt(&ok, 16);
-        if (ok) { Table.byCode[code] = val; n++; }
-    }
-    f.close();
-
-    if (n == 0)
-    { QMessageBox::warning(this, "Translate Mode", "No valid entries (expected lines like \"15c=A\")."); return; }
-
-    Table.loaded = true;
-    Table.buildEnc();
-    lblTable->setText(QString("table: %1").arg(n));
-    lastTopSig.clear(); lastBotSig.clear(); // force redecode
-    refresh(true);
-    lblStatus->setText(QString("Loaded tile table with %1 entries.").arg(n));
-}
-
-// ---------------------------------------------------------------------------
-// tile table generator (teach) + save + live apply
-// ---------------------------------------------------------------------------
-
-QTableWidget* TranslateWindow::activeTable()
-{
-    if (tblBottom->hasFocus()) return tblBottom;
-    if (tblTop->hasFocus()) return tblTop;
-    if (tblBottom->currentRow() >= 0) return tblBottom;
-    if (tblTop->currentRow() >= 0) return tblTop;
-    return nullptr;
-}
-
-void TranslateWindow::onTeach()
-{
-    QTableWidget* t = activeTable();
-    if (!t) { QMessageBox::information(this, "Teach reading",
-        "Click a line in one of the tables first, then press Teach reading."); return; }
-    int row = t->currentRow();
-    QVector<ScreenLine>& lines = (t == tblTop) ? topLines : botLines;
-    if (row < 0 || row >= lines.size()) return;
-    const ScreenLine& ln = lines[row];
-
-    bool ok = false;
-    QString reading = QInputDialog::getText(this, "Teach reading",
-        QString("This line has %1 tile(s). Type exactly what it says\n"
-                "(one character per tile, in order):").arg(ln.tiles.size()),
-        QLineEdit::Normal, ln.text, &ok);
-    if (!ok || reading.isEmpty()) return;
-
-    int n = qMin(reading.size(), ln.tiles.size());
-    for (int i = 0; i < n; i++)
-        Table.byCode[(u32)ln.tiles[i]] = QString(reading.at(i));
-    Table.loaded = true;
-    Table.buildEnc();
-    lblTable->setText(QString("table: %1").arg(Table.byCode.size()));
-    lastTopSig.clear(); lastBotSig.clear();
-    refresh(true);
-    lblStatus->setText(QString("Learned %1 tile(s). Save the table to keep it.").arg(n));
-}
-
-void TranslateWindow::onSaveTable()
-{
-    if (Table.byCode.isEmpty())
-    { QMessageBox::information(this, "Save table", "The table is empty. Use \"Teach reading\" first."); return; }
-    QString fn = QFileDialog::getSaveFileName(this, "Save tile table", "table.tbl",
-                                              "Table (*.tbl);;Text file (*.txt)");
-    if (fn.isEmpty()) return;
-    QFile f(fn);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Text))
-    { QMessageBox::critical(this, "Translate Mode", "Could not write the file."); return; }
-    QTextStream out(&f);
-    out.setEncoding(QStringConverter::Utf8);
-    QList<u32> keys = Table.byCode.keys();
-    std::sort(keys.begin(), keys.end());
-    for (u32 k : keys)
-        out << QString("%1=%2\n").arg(k, 0, 16).arg(Table.byCode.value(k));
-    f.close();
-    lblStatus->setText(QString("Saved table: %1 entries.").arg(Table.byCode.size()));
-}
 
 void TranslateWindow::onApplyLive()
 {
-    if (!Table.isLoaded())
-    { QMessageBox::information(this, "Apply to screen",
-        "Load or teach a tile table first, so translations can be turned back into tiles."); return; }
-
-    // find a blank/space tile (for padding) from the table
-    int spaceTile = -1;
-    for (auto it = Table.byCode.constBegin(); it != Table.byCode.constEnd(); ++it)
-        if (it.value() == " ") { spaceTile = (int)it.key(); break; }
-
-    int applied = 0, obj = 0;
-    auto applyList = [&](const QVector<ScreenLine>& lines)
-    {
-        for (const auto& ln : lines)
-        {
-            if (ln.translation.isEmpty()) continue;
-            QVector<int> tiles = encodeTiles(ln.translation);
-            int span = ln.c1 - ln.c0 + 1;
-
-            if (ln.kind == 0)
-            {
-                for (int i = 0; i < span; i++)
-                {
-                    int tile = (i < tiles.size()) ? tiles[i] : spaceTile;
-                    if (tile < 0) continue; // unknown char / no space: leave as-is
-                    writeTileBG(ln.engineNum, ln.bg, (ln.c0 + i) * 8, ln.ty * 8, tile);
-                }
-                applied++;
-            }
-            else // OBJ: rewrite each sprite's tile index
-            {
-                NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
-                if (!nds) continue;
-                for (int i = 0; i < ln.oam.size(); i++)
-                {
-                    int tile = (i < tiles.size()) ? tiles[i] : spaceTile;
-                    if (tile < 0) continue;
-                    u32 base = (ln.engineNum ? 0x400 : 0) + ln.oam[i] * 8 + 4;
-                    u16 a2 = nds->GPU.OAM[base] | (nds->GPU.OAM[base + 1] << 8);
-                    a2 = (u16)((a2 & 0xFC00) | (tile & 0x3FF));
-                    nds->GPU.WriteOAM<u16>((ln.engineNum ? 0x400 : 0) + ln.oam[i] * 8 + 4, a2);
-                }
-                obj++;
-            }
-        }
-    };
-    applyList(topLines);
-    applyList(botLines);
-
-    lblStatus->setText(QString("Applied translations to screen: %1 BG line(s), %2 sprite line(s). "
-                               "Static text stays; animated text may be redrawn by the game.")
-                       .arg(applied).arg(obj));
-}
-
-// ---------------------------------------------------------------------------
-// automatic OCR (offline glyph matching, best-effort)
-// ---------------------------------------------------------------------------
-
-quint64 TranslateWindow::tileMask(int engineNum, int kind, int bg, int tile)
-{
     NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
-    if (!nds) return 0;
-    GPU2D& eng = engineNum ? nds->GPU.GPU2D_B : nds->GPU.GPU2D_A;
-
-    u8* vram = nullptr; u32 mask = 0; bool bpp8 = false; u32 charBase = 0;
-    if (kind == 0)
-    {
-        u16 bgcnt = eng.BGCnt[bg]; u32 d = eng.DispCnt;
-        bpp8 = bgcnt & 0x80;
-        charBase = ((bgcnt >> 2) & 0x3) * 0x4000u + ((engineNum == 0) ? (((d >> 24) & 0x7) * 0x10000u) : 0u);
-        eng.GetBGVRAM(vram, mask);
-    }
-    else eng.GetOBJVRAM(vram, mask);
-    if (!vram || mask == 0) return 0;
-
-    u32 tb = bpp8 ? 64u : 32u;
-    u32 base = charBase + (u32)tile * tb;
-    quint64 bits = 0; int bit = 0;
-    for (int row = 0; row < 8; row++)
-        for (int col = 0; col < 8; col++)
+    if (!nds || !nds->MainRAM) { QMessageBox::warning(this, "Translate Mode", "No game is running."); return; }
+    scanActive();
+    const u32 mask = nds->MainRAMMask;
+    int n = 0, trunc = 0;
+    for (auto& f : Files)
+        for (int i = 0; i < f.originals.size(); i++)
         {
-            int px;
-            if (bpp8) px = vram[(base + row * 8 + col) & mask];
-            else { u8 b = vram[(base + row * 4 + col / 2) & mask]; px = (col & 1) ? (b >> 4) : (b & 0x0F); }
-            if (px != 0) bits |= (1ULL << bit);
-            bit++;
+            if (!f.active[i] || f.translations[i].isEmpty()) continue;
+            QByteArray enc = sjisEncode(f.translations[i]);
+            int room = f.raws[i].size();
+            if (enc.size() > room) { enc = enc.left(room); trunc++; }
+            u32 addr = f.ramAddr[i];
+            for (int k = 0; k < enc.size(); k++) nds->MainRAM[(addr + k) & mask] = (u8)enc[k];
+            for (int k = enc.size(); k < room; k++) nds->MainRAM[(addr + k) & mask] = 0x20; // pad spaces
+            n++;
         }
-    return bits;
-}
-
-void TranslateWindow::buildOcrRef()
-{
-    if (ocrRefBuilt) return;
-
-    QFont f;
-    for (const QString& name : { QString("MS Gothic"), QString("Yu Gothic"),
-                                 QString("Meiryo"), QString("Noto Sans CJK JP") })
-        if (QFontDatabase::families().contains(name)) { f.setFamily(name); break; }
-    f.setPixelSize(8);
-
-    auto addChar = [&](QChar c)
-    {
-        QImage im(8, 8, QImage::Format_ARGB32);
-        im.fill(qRgba(255, 255, 255, 255));
-        QPainter p(&im);
-        p.setFont(f);
-        p.setPen(Qt::black);
-        p.drawText(im.rect(), Qt::AlignCenter, QString(c));
-        p.end();
-        quint64 bits = 0; int bit = 0;
-        for (int row = 0; row < 8; row++)
-            for (int col = 0; col < 8; col++)
-            {
-                if (qGray(im.pixel(col, row)) < 128) bits |= (1ULL << bit);
-                bit++;
-            }
-        ocrRef.insert(c, bits);
-    };
-
-    for (ushort c = 0x21; c <= 0x7E; c++) addChar(QChar(c));            // ASCII
-    for (ushort c = 0x3041; c <= 0x3096; c++) addChar(QChar(c));        // hiragana
-    for (ushort c = 0x30A1; c <= 0x30FA; c++) addChar(QChar(c));        // katakana
-    for (ushort c = 0xFF10; c <= 0xFF19; c++) addChar(QChar(c));        // fullwidth digits
-    ocrRefBuilt = true;
-}
-
-void TranslateWindow::onAutoOCR()
-{
-    buildOcrRef();
-
-    // collect unique (engine,kind,bg,tile) from what is on screen
-    struct Key { int e, k, b, t; };
-    QHash<int, Key> uniq; // key = compact hash
-    auto collect = [&](const QVector<ScreenLine>& lines)
-    {
-        for (const auto& ln : lines)
-            for (int t : ln.tiles)
-            {
-                int h = ((ln.engineNum & 1) << 30) | ((ln.kind & 1) << 29) | ((ln.bg & 3) << 27) | (t & 0x3FF);
-                if (!uniq.contains(h)) uniq.insert(h, { ln.engineNum, ln.kind, ln.bg, t });
-            }
-    };
-    collect(topLines); collect(botLines);
-
-    const int THRESH = 10; // max differing pixels (of 64) to accept
-    int filled = 0;
-    for (auto it = uniq.constBegin(); it != uniq.constEnd(); ++it)
-    {
-        const Key& k = it.value();
-        quint64 g = tileMask(k.e, k.k, k.b, k.t);
-        if (g == 0) continue; // blank tile
-        int best = 65; QChar bestChar;
-        for (auto r = ocrRef.constBegin(); r != ocrRef.constEnd(); ++r)
-        {
-            int d = (int)std::bitset<64>(g ^ r.value()).count();
-            if (d < best) { best = d; bestChar = r.key(); }
-        }
-        if (best <= THRESH) { Table.byCode[(u32)k.t] = QString(bestChar); filled++; }
-    }
-
-    if (filled == 0)
-    {
-        QMessageBox::information(this, "Auto-OCR",
-            "No confident matches. Game fonts often don't match a system font "
-            "(especially kanji). Use \"Teach reading\" to map the tiles by hand.");
-        return;
-    }
-    Table.loaded = true;
-    Table.buildEnc();
-    lblTable->setText(QString("table: %1").arg(Table.byCode.size()));
-    lastTopSig.clear(); lastBotSig.clear();
-    refresh(true);
-    lblStatus->setText(QString("Auto-OCR guessed %1 tile(s). Fix wrong ones with Teach.").arg(filled));
+    lblStatus->setText(QString("Applied %1 active translation(s) to RAM%2.")
+                       .arg(n).arg(trunc ? QString(" (%1 truncated)").arg(trunc) : QString()));
 }
 
 // ---------------------------------------------------------------------------
-// real-time online translation
+// create translated ROM
 // ---------------------------------------------------------------------------
 
-void TranslateWindow::applyTranslationToRows(const QString& sig, const QString& translation)
-{
-    updatingTable = true;
-    auto upd = [&](QTableWidget* tbl, QVector<ScreenLine>& lines)
-    {
-        for (int i = 0; i < lines.size(); i++)
-            if (lines[i].sig == sig)
-            {
-                lines[i].translation = translation;
-                if (auto* it = tbl->item(i, COL_TRANS)) it->setText(translation);
-            }
-    };
-    upd(tblTop, topLines);
-    upd(tblBottom, botLines);
-    updatingTable = false;
-}
-
-void TranslateWindow::translateSig(const QString& sig, const QString& text)
-{
-    if (!net || text.trimmed().isEmpty()) return;
-    if (requestedSigs.contains(sig)) return;
-    requestedSigs.insert(sig);
-
-    QString tl = txtLang ? txtLang->text().trimmed() : "pt";
-    if (tl.isEmpty()) tl = "pt";
-
-    QUrl url("https://translate.googleapis.com/translate_a/single");
-    QUrlQuery q;
-    q.addQueryItem("client", "gtx");
-    q.addQueryItem("sl", "auto");
-    q.addQueryItem("tl", tl);
-    q.addQueryItem("dt", "t");
-    q.addQueryItem("q", text);
-    url.setQuery(q);
-
-    QNetworkRequest req(url);
-    req.setHeader(QNetworkRequest::UserAgentHeader, "Mozilla/5.0 melonDS");
-    QNetworkReply* rep = net->get(req);
-    connect(rep, &QNetworkReply::finished, this, [this, rep, sig]()
-    {
-        QString out;
-        if (rep->error() == QNetworkReply::NoError)
-        {
-            QJsonDocument doc = QJsonDocument::fromJson(rep->readAll());
-            if (doc.isArray())
-            {
-                QJsonArray segs = doc.array().at(0).toArray();
-                for (const auto& s : segs) out += s.toArray().at(0).toString();
-            }
-        }
-        rep->deleteLater();
-        if (!out.isEmpty())
-        {
-            transBySig[sig] = out;
-            applyTranslationToRows(sig, out);
-        }
-        else
-        {
-            requestedSigs.remove(sig); // allow a later retry
-        }
-    });
-}
-
-void TranslateWindow::doAutoTranslate()
-{
-    if (!Table.isLoaded()) return; // only translate real decoded text
-    auto go = [&](const QVector<ScreenLine>& lines)
-    {
-        for (const auto& ln : lines)
-            if (ln.translation.isEmpty() && !ln.text.trimmed().isEmpty())
-                translateSig(ln.sig, ln.text);
-    };
-    go(topLines); go(botLines);
-}
-
-void TranslateWindow::onTranslateNow()
-{
-    if (!Table.isLoaded())
-    { QMessageBox::information(this, "Translate",
-        "Translation works on decoded text. Load/teach a table or run Auto-OCR first."); return; }
-    doAutoTranslate();
-    lblStatus->setText("Requested online translation for the on-screen lines...");
-}
-
-void TranslateWindow::onAutoTranslateToggled(bool on)
-{
-    lblStatus->setText(on ? "Auto-translate on (online; decoded lines only)."
-                          : "Auto-translate off.");
-    if (on) doAutoTranslate();
-}
-
-// ---------------------------------------------------------------------------
-// guide
-// ---------------------------------------------------------------------------
-
-void TranslateWindow::onGuide()
-{
-    QMessageBox::information(this, "Translate Mode - Guide",
-        "Live on-screen text\n"
-        "-------------------\n"
-        "This shows what the DS is drawing right now, split into the top and the\n"
-        "bottom screen. Only the text currently on screen is listed, in real time.\n\n"
-        "The game draws text with its own font tiles, so each line is shown as tile\n"
-        "codes until you provide a tile table.\n\n"
-        "Steps:\n"
-        "1) Reach a screen with text. Lines appear in the two tables.\n"
-        "2) Pause emulation to freeze the frame and inspect calmly.\n"
-        "3) Inspect (click screen): arm it, then click a piece of text on the bottom\n"
-        "   (touch) screen - the matching line is highlighted in the bottom table.\n"
-        "4) Build a tile table: a text file with lines like\n"
-        "        15c=A\n"
-        "        15d=B\n"
-        "   mapping each tile code (shown in the list) to its letter. Load it with\n"
-        "   \"Load table...\" and the lines become readable text.\n"
-        "5) Type your translation in the Translation column; it is remembered per\n"
-        "   line. Save/Load project or Export/Import .txt to work in bulk.\n\n"
-        "Note: only background-layer (BG) text is read, and click-inspect works on\n"
-        "the bottom (touch) screen only.");
-}
-
-// ---------------------------------------------------------------------------
-// export / import / project
-// ---------------------------------------------------------------------------
-
-void TranslateWindow::onExportTxt()
-{
-    QString fn = QFileDialog::getSaveFileName(this, "Export text", "dump.txt", "Text file (*.txt)");
-    if (fn.isEmpty()) return;
-    QFile f(fn);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Text))
-    { QMessageBox::critical(this, "Translate Mode", "Could not write the file."); return; }
-    QTextStream out(&f);
-    out.setEncoding(QStringConverter::Utf8);
-    out << "# ORIGINAL<TAB>TRANSLATION (per on-screen line)\n";
-    auto dump = [&](const QVector<ScreenLine>& v) {
-        for (const auto& l : v) {
-            QString o = l.text; o.replace('\t', ' ');
-            QString t = l.translation; t.replace('\t', ' ');
-            out << o << '\t' << t << '\n';
-        }
-    };
-    dump(topLines); dump(botLines);
-    f.close();
-    lblStatus->setText("Exported current on-screen lines.");
-}
-
-void TranslateWindow::onImportTxt()
-{
-    QString fn = QFileDialog::getOpenFileName(this, "Import text", "", "Text file (*.txt)");
-    if (fn.isEmpty()) return;
-    QFile f(fn);
-    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
-    { QMessageBox::critical(this, "Translate Mode", "Could not open the file."); return; }
-    QTextStream in(&f);
-    in.setEncoding(QStringConverter::Utf8);
-    int applied = 0;
-    while (!in.atEnd())
-    {
-        QString line = in.readLine();
-        if (line.startsWith('#')) continue;
-        int tab = line.indexOf('\t');
-        if (tab < 0) continue;
-        QString orig = line.left(tab), trans = line.mid(tab + 1);
-        if (trans.isEmpty()) continue;
-        auto apply = [&](QVector<ScreenLine>& v) {
-            for (auto& l : v) if (l.text == orig) { l.translation = trans; transBySig[l.sig] = trans; applied++; }
-        };
-        apply(topLines); apply(botLines);
-    }
-    f.close();
-    rebuildTable(tblTop, topLines);
-    rebuildTable(tblBottom, botLines);
-    lblStatus->setText(QString("Imported %1 translation(s).").arg(applied));
-}
-
-void TranslateWindow::onSaveProject()
-{
-    QString fn = QFileDialog::getSaveFileName(this, "Save project", "translation.json",
-                                              "Translation project (*.json)");
-    if (fn.isEmpty()) return;
-    QJsonArray arr;
-    for (auto it = transBySig.constBegin(); it != transBySig.constEnd(); ++it)
-    {
-        QJsonObject o;
-        o["sig"] = it.key();
-        o["translation"] = it.value();
-        arr.append(o);
-    }
-    QJsonObject root;
-    root["tool"] = "melonDS Translate Mode (tiles)";
-    root["entries"] = arr;
-    QFile f(fn);
-    if (!f.open(QIODevice::WriteOnly))
-    { QMessageBox::critical(this, "Translate Mode", "Could not write the file."); return; }
-    f.write(QJsonDocument(root).toJson());
-    f.close();
-    lblStatus->setText(QString("Project saved: %1 translations.").arg(transBySig.size()));
-}
-
-void TranslateWindow::onLoadProject()
-{
-    QString fn = QFileDialog::getOpenFileName(this, "Load project", "",
-                                              "Translation project (*.json)");
-    if (fn.isEmpty()) return;
-    QFile f(fn);
-    if (!f.open(QIODevice::ReadOnly))
-    { QMessageBox::critical(this, "Translate Mode", "Could not open the file."); return; }
-    QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
-    f.close();
-    if (!doc.isObject()) { QMessageBox::critical(this, "Translate Mode", "Invalid project file."); return; }
-    QJsonArray arr = doc.object()["entries"].toArray();
-    for (const auto& v : arr)
-    {
-        QJsonObject o = v.toObject();
-        transBySig[o["sig"].toString()] = o["translation"].toString();
-    }
-    lastTopSig.clear(); lastBotSig.clear();
-    refresh(true);
-    lblStatus->setText(QString("Project loaded: %1 translations.").arg(transBySig.size()));
-}
-
-// ===========================================================================
-// ROM text tab: read/translate the real text stored in the cartridge ROM
-// ===========================================================================
-
-static const QHash<quint16, uint>& romSjisFwd()
-{
-    static QHash<quint16, uint> m;
-    if (m.isEmpty())
-        for (int i = 0; i < kSJISTableLen; i++) m.insert(kSJISTable[i].key, kSJISTable[i].cp);
-    return m;
-}
-static const QHash<uint, quint16>& romSjisRev()
-{
-    static QHash<uint, quint16> m;
-    if (m.isEmpty())
-        for (int i = 0; i < kSJISTableLen; i++)
-            if (!m.contains(kSJISTable[i].cp)) m.insert(kSJISTable[i].cp, kSJISTable[i].key);
-    return m;
-}
-
-static QString romDecode(const QByteArray& raw)
-{
-    QString out; int n = raw.size();
-    for (int i = 0; i < n; )
-    {
-        u8 b = (u8)raw[i];
-        if (b == 0x0A) { out += "\\n"; i++; continue; }
-        if (b >= 0x20 && b <= 0x7E) { out += QChar((char16_t)b); i++; continue; }
-        if (b >= 0xA1 && b <= 0xDF) { out += QChar((char16_t)(0xFF61 + (b - 0xA1))); i++; continue; }
-        if (((b >= 0x81 && b <= 0x9F) || (b >= 0xE0 && b <= 0xFC)) && i + 1 < n)
-        {
-            u8 t = (u8)raw[i + 1];
-            quint16 key = (quint16)((b << 8) | t);
-            auto it = romSjisFwd().find(key);
-            if (it != romSjisFwd().end()) { out += QChar((char16_t)it.value()); i += 2; continue; }
-        }
-        out += QString("{%1}").arg((int)b, 2, 16, QChar('0'));
-        i++;
-    }
-    return out;
-}
-
-static QByteArray romEncode(const QString& s)
-{
-    QByteArray out; int i = 0, n = s.size();
-    while (i < n)
-    {
-        QChar c = s.at(i);
-        if (c == '\\' && i + 1 < n && s.at(i + 1) == 'n') { out.append((char)0x0A); i += 2; continue; }
-        if (c == '{' && i + 3 < n && s.at(i + 3) == '}')
-        {
-            bool ok = false; int v = s.mid(i + 1, 2).toInt(&ok, 16);
-            if (ok) { out.append((char)v); i += 4; continue; }
-        }
-        uint cp = c.unicode();
-        if (cp >= 0x20 && cp <= 0x7E) { out.append((char)cp); i++; continue; }
-        if (cp >= 0xFF61 && cp <= 0xFF9F) { out.append((char)(0xA1 + (cp - 0xFF61))); i++; continue; }
-        auto it = romSjisRev().find(cp);
-        if (it != romSjisRev().end()) { quint16 k = it.value(); out.append((char)(k >> 8)); out.append((char)(k & 0xFF)); }
-        else out.append('?');
-        i++;
-    }
-    return out;
-}
-
-namespace {
-struct RomFS
-{
-    const u8* d; u32 len; u32 fntOff, fatOff;
-    u16 rd16(u32 o) const { return (u32)d[o] | ((u32)d[o+1] << 8); }
-    u32 rd32(u32 o) const { return (u32)d[o] | ((u32)d[o+1]<<8) | ((u32)d[o+2]<<16) | ((u32)d[o+3]<<24); }
-};
-void romFsWalk(const RomFS& fs, u16 did, const QString& path,
-               std::vector<std::tuple<QString,u32,u32>>& out)
-{
-    u32 ent = fs.fntOff + (did & 0xFFF) * 8;
-    if (ent + 6 > fs.len) return;
-    u32 sub = fs.fntOff + fs.rd32(ent);
-    u16 fid = fs.rd16(ent + 4);
-    u32 p = sub;
-    while (p < fs.len)
-    {
-        u8 t = fs.d[p]; p++;
-        if (t == 0) break;
-        int l = t & 0x7F; bool isd = t & 0x80;
-        if (p + l > fs.len) break;
-        QString name = QString::fromLatin1((const char*)(fs.d + p), l); p += l;
-        if (isd)
-        {
-            if (p + 2 > fs.len) break;
-            u16 d2 = fs.rd16(p); p += 2;
-            romFsWalk(fs, d2, path + name + "/", out);
-        }
-        else
-        {
-            u32 fa = fs.fatOff + fid * 8;
-            if (fa + 8 <= fs.len) out.push_back(std::make_tuple(path + name, fs.rd32(fa), fs.rd32(fa + 4)));
-            fid++;
-        }
-    }
-}
-} // namespace
-
-static bool romParsePtr(const u8* b, u32 size, QVector<QString>& outStr, QVector<QByteArray>& outRaw)
-{
-    if (size < 6) return false;
-    u32 count = (u32)b[0] | ((u32)b[1] << 8);
-    if (count == 0 || count > 8000) return false;
-    u32 base = 2 + 2 * count;
-    if (base > size) return false;
-    QVector<u32> offs;
-    for (u32 i = 0; i < count; i++)
-    {
-        u32 o = (u32)b[2 + 2*i] | ((u32)b[2 + 2*i + 1] << 8);
-        if (base + o > size) return false;
-        offs.append(o);
-    }
-    int ok = 0;
-    for (u32 i = 0; i < count; i++)
-    {
-        u32 p = base + offs[i]; u32 end = p;
-        while (end < size && b[end] != 0x00) end++;
-        QByteArray raw((const char*)(b + p), (int)(end - p));
-        int bad = 0; for (u8 c : raw) if (c < 0x20 && c != 0x0A) bad++;
-        if (bad == 0) ok++;
-        outRaw.append(raw);
-        outStr.append(romDecode(raw));
-    }
-    return ok >= (int)((count * 7) / 10);
-}
-
-const u8* TranslateWindow::romData(u32& len)
-{
-    NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
-    if (!nds) return nullptr;
-    NDSCart::CartCommon* cart = nds->GetNDSCart();
-    if (!cart) return nullptr;
-    len = cart->GetROMLength();
-    return cart->GetROM();
-}
-
-void TranslateWindow::onRomScan()
+void TranslateWindow::onCreateRom()
 {
     u32 len = 0; const u8* d = romData(len);
-    if (!d || len < 0x200) { QMessageBox::warning(this, "ROM text", "No cartridge ROM loaded."); return; }
-
-    RomFS fs; fs.d = d; fs.len = len;
-    fs.fntOff = fs.rd32(0x40); fs.fatOff = fs.rd32(0x48);
-    if (fs.fntOff + 8 > len || fs.fatOff + 8 > len)
-    { QMessageBox::warning(this, "ROM text", "Could not read the ROM filesystem."); return; }
-
-    std::vector<std::tuple<QString,u32,u32>> files;
-    romFsWalk(fs, 0xF000, "", files);
-
-    RomFiles.clear();
-    int total = 0;
-    for (auto& f : files)
-    {
-        QString path = std::get<0>(f); u32 s = std::get<1>(f), e = std::get<2>(f);
-        if (e <= s || e > len) continue;
-        QVector<QString> strs; QVector<QByteArray> raws;
-        if (!romParsePtr(d + s, e - s, strs, raws)) continue;
-        RomTextFile rt;
-        rt.path = path; rt.start = s; rt.end = e;
-        rt.originals = strs; rt.raws = raws;
-        rt.translations = QVector<QString>(strs.size());
-        RomFiles.push_back(rt);
-        total += strs.size();
-    }
-    rebuildRomTable();
-    romStatus->setText(QString("Found %1 text file(s), %2 string(s). Translate and press \"Create translated ROM\".")
-                       .arg((int)RomFiles.size()).arg(total));
-}
-
-void TranslateWindow::rebuildRomTable()
-{
-    updatingRom = true;
-    RomRows.clear();
-    QString filter = romFilter->text();
-    for (int fi = 0; fi < (int)RomFiles.size(); fi++)
-        for (int si = 0; si < RomFiles[fi].originals.size(); si++)
-        {
-            if (!filter.isEmpty() &&
-                !RomFiles[fi].originals[si].contains(filter, Qt::CaseInsensitive) &&
-                !RomFiles[fi].path.contains(filter, Qt::CaseInsensitive) &&
-                !RomFiles[fi].translations[si].contains(filter, Qt::CaseInsensitive))
-                continue;
-            RomRows.append(qMakePair(fi, si));
-        }
-    romTable->setRowCount(RomRows.size());
-    for (int r = 0; r < RomRows.size(); r++)
-    {
-        int fi = RomRows[r].first, si = RomRows[r].second;
-        auto setCell = [&](int col, const QString& txt, bool ed)
-        {
-            QTableWidgetItem* it = new QTableWidgetItem(txt);
-            if (ed) it->setFlags(it->flags() | Qt::ItemIsEditable);
-            else    it->setFlags(it->flags() & ~Qt::ItemIsEditable);
-            romTable->setItem(r, col, it);
-        };
-        setCell(0, RomFiles[fi].path, false);
-        setCell(1, QString::number(si), false);
-        setCell(2, RomFiles[fi].originals[si], false);
-        setCell(3, RomFiles[fi].translations[si], true);
-    }
-    updatingRom = false;
-}
-
-void TranslateWindow::onRomFilterChanged(const QString&) { rebuildRomTable(); }
-
-void TranslateWindow::onRomCellChanged(int row, int col)
-{
-    if (updatingRom || col != 3) return;
-    if (row < 0 || row >= RomRows.size()) return;
-    int fi = RomRows[row].first, si = RomRows[row].second;
-    RomFiles[fi].translations[si] = romTable->item(row, col)->text();
-}
-
-void TranslateWindow::onRomCreateRom()
-{
-    u32 len = 0; const u8* d = romData(len);
-    if (!d || len == 0) { QMessageBox::warning(this, "ROM text", "No cartridge ROM loaded."); return; }
+    if (!d || len == 0) { QMessageBox::warning(this, "Translate Mode", "No cartridge ROM loaded."); return; }
     QByteArray rom((const char*)d, (int)len);
 
     int patchedFiles = 0, patchedStrings = 0, tooBig = 0;
     QStringList overflow;
-    for (const RomTextFile& f : RomFiles)
+    for (const RomTextFile& f : Files)
     {
         bool any = false;
         for (const QString& t : f.translations) if (!t.isEmpty()) { any = true; break; }
@@ -1627,7 +519,7 @@ void TranslateWindow::onRomCreateRom()
         for (int i = 0; i < count; i++)
         {
             offs.append(blob.size());
-            blob.append(f.translations[i].isEmpty() ? f.raws[i] : romEncode(f.translations[i]));
+            blob.append(f.translations[i].isEmpty() ? f.raws[i] : sjisEncode(f.translations[i]));
             blob.append('\0');
         }
         QByteArray rebuilt;
@@ -1654,30 +546,34 @@ void TranslateWindow::onRomCreateRom()
     }
 
     if (patchedFiles == 0 && tooBig == 0)
-    { QMessageBox::information(this, "ROM text", "No translations entered yet."); return; }
+    { QMessageBox::information(this, "Translate Mode", "No translations entered yet."); return; }
 
     QString fn = QFileDialog::getSaveFileName(this, "Save translated ROM", "translated.nds", "Nintendo DS ROM (*.nds)");
     if (fn.isEmpty()) return;
     QFile out(fn);
-    if (!out.open(QIODevice::WriteOnly)) { QMessageBox::critical(this, "ROM text", "Could not write the output file."); return; }
+    if (!out.open(QIODevice::WriteOnly)) { QMessageBox::critical(this, "Translate Mode", "Could not write the output file."); return; }
     out.write(rom); out.close();
 
     QString msg = QString("Translated ROM written to:\n%1\n\nFiles patched: %2\nStrings patched: %3")
                   .arg(fn).arg(patchedFiles).arg(patchedStrings);
     if (tooBig)
-        msg += QString("\n\n%1 file(s) did NOT fit (translation longer than the original space):\n - %2")
+        msg += QString("\n\n%1 file(s) did NOT fit (translation longer than original space):\n - %2")
                .arg(tooBig).arg(overflow.join("\n - "));
-    QMessageBox::information(this, "ROM text", msg);
-    romStatus->setText(QString("Saved translated ROM (%1 files, %2 strings, %3 didn't fit).")
+    QMessageBox::information(this, "Translate Mode", msg);
+    lblStatus->setText(QString("Saved translated ROM (%1 files, %2 strings, %3 didn't fit).")
                        .arg(patchedFiles).arg(patchedStrings).arg(tooBig));
 }
 
-void TranslateWindow::onRomSaveProject()
+// ---------------------------------------------------------------------------
+// project save / load
+// ---------------------------------------------------------------------------
+
+void TranslateWindow::onSaveProject()
 {
-    QString fn = QFileDialog::getSaveFileName(this, "Save ROM text project", "romtext.json", "Project (*.json)");
+    QString fn = QFileDialog::getSaveFileName(this, "Save project", "translation.json", "Project (*.json)");
     if (fn.isEmpty()) return;
     QJsonArray arr;
-    for (const RomTextFile& f : RomFiles)
+    for (const RomTextFile& f : Files)
     {
         QJsonObject o; o["file"] = f.path;
         QJsonArray os, ts;
@@ -1685,32 +581,32 @@ void TranslateWindow::onRomSaveProject()
         for (const QString& s : f.translations) ts.append(s);
         o["originals"] = os; o["translations"] = ts; arr.append(o);
     }
-    QJsonObject root; root["tool"] = "melonDS ROM text"; root["files"] = arr;
+    QJsonObject root; root["tool"] = "melonDS Translate Mode"; root["files"] = arr;
     QFile out(fn);
-    if (!out.open(QIODevice::WriteOnly)) { QMessageBox::critical(this, "ROM text", "Cannot write file."); return; }
+    if (!out.open(QIODevice::WriteOnly)) { QMessageBox::critical(this, "Translate Mode", "Cannot write file."); return; }
     out.write(QJsonDocument(root).toJson()); out.close();
-    romStatus->setText("ROM text project saved.");
+    lblStatus->setText("Project saved.");
 }
 
-void TranslateWindow::onRomLoadProject()
+void TranslateWindow::onLoadProject()
 {
-    QString fn = QFileDialog::getOpenFileName(this, "Load ROM text project", "", "Project (*.json)");
+    QString fn = QFileDialog::getOpenFileName(this, "Load project", "", "Project (*.json)");
     if (fn.isEmpty()) return;
     QFile in(fn);
-    if (!in.open(QIODevice::ReadOnly)) { QMessageBox::critical(this, "ROM text", "Cannot open file."); return; }
+    if (!in.open(QIODevice::ReadOnly)) { QMessageBox::critical(this, "Translate Mode", "Cannot open file."); return; }
     QJsonDocument doc = QJsonDocument::fromJson(in.readAll()); in.close();
-    if (!doc.isObject()) { QMessageBox::critical(this, "ROM text", "Invalid project."); return; }
+    if (!doc.isObject()) { QMessageBox::critical(this, "Translate Mode", "Invalid project."); return; }
     QJsonArray arr = doc.object()["files"].toArray();
     for (const auto& v : arr)
     {
         QJsonObject o = v.toObject();
         QString path = o["file"].toString();
         QJsonArray ts = o["translations"].toArray();
-        for (RomTextFile& f : RomFiles)
+        for (RomTextFile& f : Files)
             if (f.path == path)
                 for (int i = 0; i < ts.size() && i < f.translations.size(); i++)
                     f.translations[i] = ts[i].toString();
     }
-    rebuildRomTable();
-    romStatus->setText("ROM text project loaded.");
+    rebuildTable();
+    lblStatus->setText("Project loaded.");
 }

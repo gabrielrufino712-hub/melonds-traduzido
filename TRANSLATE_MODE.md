@@ -1,138 +1,51 @@
-# Translate Mode (custom feature) — live on-screen text
+# Translate Mode (custom feature)
 
-A tool under **System → Translate Mode** that reads the text a DS game is drawing
-**right now** and lets you translate it.
+One unified tool under **System → Translate Mode** to translate a DS game's text
+and produce a translated ROM.
 
-## ROM text tab (real game text → translated .nds)
+## What it does
 
-Inside **Translate Mode** there are two tabs. The **ROM text** tab works at the
-ROM level (not the screen): it parses the cartridge's NDS filesystem, finds the
-game's pointer-table Shift-JIS text files and shows every string as **real,
-readable, editable text**. Type a translation and **Create translated ROM...**
-writes a patched `.nds`.
+It reads the **real text stored in the cartridge ROM**: it parses the NDS
+filesystem, finds the game's pointer-table Shift-JIS text files and shows every
+string as readable, editable text (File / index / Original JP / Translation).
 
-* Decodes the game's actual cp932 text (rules, menus, titles, pauses, prompts…).
-* Untranslated lines are written back byte-for-byte (safe round-trip); only the
-  strings you edit are re-encoded.
-* This first version patches **in place**, so a translation must fit the space of
-  the original string (Japanese is 2 bytes/char, so there is usually room). Lines
-  that don't fit are reported and left untouched — shortening them or a full ROM
-  repack (planned) is needed.
-* Not yet covered: character descriptions packed inside the `.aar` (ALAR/DSTX)
-  archives, and menu buttons that are graphics rather than text.
-
-## Why it reads tiles, not RAM
-
-DS games don't keep their on-screen text as normal Shift-JIS/Unicode in memory —
-they draw it from a font as background **tiles**. So instead of scanning raw RAM
-(which is mostly noise), Translate Mode walks the **background tilemaps** of both
-2D engines every ~0.3s and turns the visible tile rows into text lines. You only
-ever see what is on screen at this moment, in real time.
-
-## Two tables
-
-The window has two tables:
-
-* **Top screen (tela de cima)**
-* **Bottom screen (tela de baixo)**
-
-Each line shows its layer (BG0-3 or **OBJ** for sprite text), its row, the
-on-screen text and an editable **Translation** column. Both background tiles and
-**sprite (OBJ) text** are read.
-
-## Building the table automatically (Teach)
-
-Instead of writing the `.tbl` by hand, use **Teach reading**: select a line, click
-it and type exactly what that line says. The tool maps each tile to the character
-you typed (tile = char) and instantly decodes every matching line. **Save table...**
-writes the `.tbl` so you can reuse it; **Load table...** loads one back.
-
-## Direct translation editing (live)
-
-Type your translation in the **Translation** column, then **Apply to screen
-(live)** writes it back onto the running game using the table — both BG lines and
-sprite lines. Static text (menus, names) stays changed; text the game redraws
-every frame may revert.
-
-## Auto-OCR (best-effort)
-
-**Auto-OCR glyphs** tries to guess each tile's character by matching its shape to
-a system font. It works reasonably for kana and latin letters, but **kanji at 8x8
-is unreliable** and often stays as tile codes — treat OCR as a head start and fix
-the wrong guesses with **Teach reading**. No internet needed.
-
-## Real-time translation (online)
-
-Tick **Auto-translate (online)** (and set the target language, e.g. `pt`) to have
-decoded lines translated in real time by an online service; **Translate now** does
-it once on demand. Requirements and limits: needs **internet**; only works on
-lines that are already **real text** (via table / Teach / Auto-OCR), not raw tile
-codes; and it uses an unofficial endpoint that may rate-limit or change.
-
-## Translation overlay on the game
-
-Tick **Overlay on game** to show the translations as a subtitle drawn over the
-emulator screen (bottom-centre), in real time, on both the software and OpenGL
-renderers. This does NOT depend on the game having a latin font — it draws over
-the picture like a fan-translation subtitle. Note: the on-screen font is
-ASCII-only, so accents are approximated (`tradução` shows as `traducao`).
-
-Writing the translation back into the game's own tiles (**Apply to screen**) only
-works if the game's font actually contains those letters as tiles — most Japanese
-games don't, which is why the overlay is the reliable way to see a translation
-live.
-
-## Seeing the actual characters
-
-The on-screen text is drawn from the game's own font, so each line first appears
-as tile codes (e.g. `15c 15d 15e`) — those numbers **are** the text, in the game's
-internal font. Two ways to read them:
-
-* **Show glyphs** (on by default) — draws each tile's real pixels next to the
-  codes, so you literally SEE the kanji/kana/latin characters as images, with no
-  table needed.
-* **Tile table** — to get them as selectable/typable letters, map tile codes to
-  characters (see below).
-
-```
-15c=A
-15d=B
-8140=(space)
-```
-
-Load it with **Load table...** and the lines become readable text. Tick **Show
-tile codes** to switch back to raw numbers while building the table.
+While the game runs it also scans main RAM and **highlights (green) the strings
+the game is using right now** — the text currently loaded / on screen — and can
+auto-scroll to them ("Follow"). This is how you see, in real time, which line of
+the list corresponds to what is happening in the emulator.
 
 ## Controls
 
-* **Pause emulation** — freeze the frame to inspect/translate calmly.
-* **Live (auto-refresh)** — keep the tables updating in real time (on by default).
-* **Min length** — ignore tile runs shorter than this (cuts stray single tiles).
-* **Inspect (click screen)** — arm it, then click a piece of text on the **bottom
-  (touch)** screen; the matching line is highlighted (green) in the bottom table.
-* **Guide** — shows this workflow in-app.
-* **Export/Import .txt**, **Save/Load project** — translate in bulk / keep your
-  work (translations are remembered per line across scene changes).
+* **Scan ROM text** — read the loaded cartridge and list all its text.
+* **Highlight active text** / **Follow** — highlight and scroll to the strings in
+  use at this moment of emulation.
+* **Pause emulation** — freeze to translate/inspect calmly.
+* **Filter** — search by text or file.
+* Type the translation in the **Translation** column.
+* **Apply to RAM (live)** — write the translations of the currently-active strings
+  straight into the game's RAM for an instant on-screen preview (fits the original
+  length; longer text is truncated).
+* **Save/Load project** — keep the work as JSON.
+* **Create translated ROM...** — rebuild the text files and write a patched `.nds`.
+  Untranslated strings are kept byte-for-byte; only edited ones are re-encoded.
 
-## Limits (honest)
+## Notes / limits (honest)
 
-* Only **background-layer** text is read. Text drawn as sprites (OBJ) is not
-  covered.
-* **Click-inspect** works on the **bottom** screen only (the top screen has no
-  click coordinates on the DS).
-* Turning tile text into a translated ROM means editing the game's font/tilemaps,
-  which is game-specific and not automated here — this tool is the reading,
-  inspecting and translation-drafting stage.
+* The patched ROM writes **in place**, so a translation must fit the space of the
+  original string (Japanese is 2 bytes/char, so there is usually room). Lines that
+  don't fit are listed and left untouched; a full ROM repack (to allow longer
+  text) is a planned next step.
+* Not yet covered: character descriptions packed inside the `.aar` (ALAR/DSTX)
+  archives, and menu buttons that are graphics rather than text.
 
 ## Files
 
-Added: `src/frontend/qt_sdl/TranslateWindow.{h,cpp}`.
-Changed: `Window.{h,cpp}` (System menu entry), `Screen.cpp` (inspect click hook),
-`src/frontend/qt_sdl/CMakeLists.txt`.
+Added: `src/frontend/qt_sdl/TranslateWindow.{h,cpp}`,
+`src/frontend/qt_sdl/TranslateSJIS.h` (compiled cp932 table).
+Changed: `Window.{h,cpp}` (System menu entry), `src/frontend/qt_sdl/CMakeLists.txt`.
 
 ## Building the .exe
 
 Push this source to your GitHub repo — the included **Windows** GitHub Actions
 workflow builds `melonDS.exe` and offers it as the `melonDS-windows-x86_64`
-artifact. (Local Windows: `cmake --preset release-windows-x86_64` then
-`cmake --build --preset release-windows-x86_64`.)
+artifact.

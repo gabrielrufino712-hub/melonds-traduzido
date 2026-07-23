@@ -16,18 +16,13 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
-// Translate Mode - live on-screen text reader
-// --------------------------------------------
-// Instead of scanning raw RAM (which is full of noise), this reads what the DS
-// is ACTUALLY drawing right now: it walks the background tilemaps of both 2D
-// engines every refresh and turns the visible tile rows into text lines. The
-// result is split into two tables - Top screen and Bottom screen - so you always
-// see only the text that is on screen at this moment, in real time.
-//
-// Tiles are the game's own font glyph indices. Load a tile table (.tbl, lines
-// like "15c=A") to see them as readable letters; without one the raw tile codes
-// are shown so you can build the table. "Inspect (click screen)" lets you click
-// text on the bottom screen and highlights the matching line in the table.
+// Translate Mode (unified)
+// ------------------------
+// Reads the REAL text stored in the cartridge ROM (parses the NDS filesystem and
+// the game's pointer-table Shift-JIS text files), shows every string as readable,
+// editable text, and can write a patched translated .nds. While the game runs it
+// also scans main RAM and HIGHLIGHTS the strings the game is currently using
+// (the text loaded/on screen at this moment), and can apply a translation live.
 
 #ifndef TRANSLATEWINDOW_H
 #define TRANSLATEWINDOW_H
@@ -36,29 +31,22 @@
 #include <QTimer>
 #include <QString>
 #include <QByteArray>
-#include <QHash>
 #include <QVector>
 #include <QPair>
-#include <QSet>
+#include <QHash>
+#include <vector>
 
 #include "types.h"
 
 class QTableWidget;
-class QTableWidgetItem;
 class QPushButton;
 class QCheckBox;
-class QComboBox;
-class QSpinBox;
 class QLineEdit;
 class QLabel;
-class QImage;
-class QNetworkAccessManager;
-class QTabWidget;
 class EmuInstance;
 
-namespace melonDS { class NDS; class GPU2D; }
+namespace melonDS { class NDS; }
 
-// One text file inside the cartridge ROM (pointer-table Shift-JIS).
 struct RomTextFile
 {
     QString path;
@@ -67,33 +55,8 @@ struct RomTextFile
     QVector<QString> originals;
     QVector<QString> translations;
     QVector<QByteArray> raws;
-};
-
-// A run of tiles forming one on-screen text line.
-struct ScreenLine
-{
-    int kind = 0;        // 0 = BG layer, 1 = OBJ (sprite)
-    int engineNum = 0;   // 0 = engine A, 1 = engine B
-    int bg = 0;
-    int ty = 0;          // visible tile row
-    int c0 = 0, c1 = 0;  // visible tile column range
-    QVector<int> tiles;
-    QVector<int> oam;    // OBJ: source sprite indices, in order
-    QString sig;         // stable signature, key for translations
-    QString text;        // decoded text (or hex tile codes)
-    QString translation;
-};
-
-// Custom tile/character table (Thingy-style .tbl: "HEX=value" per line).
-struct CharTable
-{
-    QHash<melonDS::u32, QString> byCode;                  // tile/char code -> string
-    QVector<QPair<QString, melonDS::u32>> enc;            // string -> code (longest first)
-    bool loaded = false;
-
-    void clear() { byCode.clear(); enc.clear(); loaded = false; }
-    bool isLoaded() const { return loaded; }
-    void buildEnc();
+    QVector<char> active;             // currently present in RAM?
+    QVector<melonDS::u32> ramAddr;    // where it was found in main RAM
 };
 
 class TranslateWindow : public QDialog
@@ -107,112 +70,48 @@ public:
     static TranslateWindow* currentDlg;
     static TranslateWindow* openDlg(QWidget* parent)
     {
-        if (currentDlg)
-        {
-            currentDlg->activateWindow();
-            return currentDlg;
-        }
+        if (currentDlg) { currentDlg->activateWindow(); return currentDlg; }
         currentDlg = new TranslateWindow(parent);
         currentDlg->show();
         return currentDlg;
     }
     static void closeDlg() { currentDlg = nullptr; }
 
-    // Called by the emulator screen widget when the user clicks the bottom
-    // (touch) screen while "Inspect (click screen)" is armed.
-    bool isInspectArmed() const { return inspectArmed; }
-    void screenPick(int dsx, int dsy);
-
 private slots:
     void onTick();
-    void onRefreshNow();
+    void onScan();
     void onTogglePause();
-    void onLoadTable();
-    void onSaveTable();
-    void onTeach();
+    void onFilterChanged(const QString& text);
+    void onCellChanged(int row, int col);
     void onApplyLive();
-    void onGuide();
-    void onToggleInspect(bool on);
-    void onAutoOCR();
-    void onTranslateNow();
-    void onAutoTranslateToggled(bool on);
-    // ROM text tab
-    void onRomScan();
-    void onRomFilterChanged(const QString& text);
-    void onRomCellChanged(int row, int col);
-    void onRomSaveProject();
-    void onRomLoadProject();
-    void onRomCreateRom();
-    void onTopCellChanged(int row, int col);
-    void onBottomCellChanged(int row, int col);
     void onSaveProject();
     void onLoadProject();
-    void onExportTxt();
-    void onImportTxt();
+    void onCreateRom();
 
 private:
-    void refresh(bool force);
-    void readScreen(melonDS::GPU2D& eng, bool engineA, QVector<ScreenLine>& out);
-    void readSprites(melonDS::GPU2D& eng, int engineNum, QVector<ScreenLine>& out);
-    int  readTileIndex(melonDS::GPU2D& eng, bool engineA, int bg, int dsx, int dsy);
-    bool isTextTile(int engineNum, int kind, int bg, int tile);
-    void writeTileBG(int engineNum, int bg, int dsx, int dsy, int tileIndex);
-    QVector<int> encodeTiles(const QString& text);
-    QString decodeLine(const QVector<int>& tiles);
-    QImage renderLineImage(const ScreenLine& ln);
-    QString lineSignature(int kind, int bg, const QVector<int>& tiles);
-    void rebuildTable(QTableWidget* tbl, const QVector<ScreenLine>& lines);
+    void rebuildTable();
+    void buildPrefixIndex();
+    void scanActive();
     void refreshPauseButton();
-    void highlightBottomLine(int lineIndex);
-    QTableWidget* activeTable();
-    void rebuildRomTable();
     const melonDS::u8* romData(melonDS::u32& len);
-    quint64 tileMask(int engineNum, int kind, int bg, int tile);
-    void buildOcrRef();
-    void translateSig(const QString& sig, const QString& text);
-    void doAutoTranslate();
-    void applyTranslationToRows(const QString& sig, const QString& translation);
 
     EmuInstance* emuInstance = nullptr;
 
-    QTableWidget* tblTop = nullptr;
-    QTableWidget* tblBottom = nullptr;
+    QTableWidget* table = nullptr;
     QPushButton*  btnPause = nullptr;
-    QPushButton*  btnInspect = nullptr;
-    QCheckBox*    chkAuto = nullptr;
-    QCheckBox*    chkHex = nullptr;
-    QCheckBox*    chkGlyph = nullptr;
-    QCheckBox*    chkTranslate = nullptr;
-    QCheckBox*    chkOverlay = nullptr;
-    QLineEdit*    txtLang = nullptr;
-    QSpinBox*     spnMinRun = nullptr;
+    QCheckBox*    chkHighlight = nullptr;
+    QCheckBox*    chkFollow = nullptr;
+    QLineEdit*    txtFilter = nullptr;
     QLabel*       lblStatus = nullptr;
-    QLabel*       lblTable = nullptr;
 
-    QTimer* refreshTimer = nullptr;
+    QTimer* timer = nullptr;
 
-    QVector<ScreenLine> topLines, botLines;
-    QString lastTopSig, lastBotSig;
-    QHash<QString, QString> transBySig;   // persists translations across refreshes
+    std::vector<RomTextFile> Files;
+    QVector<QPair<int,int>> Rows;                 // table row -> (file, string)
+    QHash<int,int> RowOf;                          // (file*100000+str) -> table row
+    QMultiHash<quint32, QPair<int,int>> Prefix;    // first 4 raw bytes -> (file,string)
 
-    CharTable Table;
-
-    QNetworkAccessManager* net = nullptr;
-    QHash<QChar, quint64> ocrRef;
-    bool ocrRefBuilt = false;
-    QSet<QString> requestedSigs;
-
-    bool inspectArmed = false;
-    int  highlightedRow = -1;
     bool updatingTable = false;
-
-    // ROM text tab
-    QTableWidget* romTable = nullptr;
-    QLineEdit*    romFilter = nullptr;
-    QLabel*       romStatus = nullptr;
-    std::vector<RomTextFile> RomFiles;
-    QVector<QPair<int,int>> RomRows;
-    bool updatingRom = false;
 };
 
 #endif // TRANSLATEWINDOW_H
