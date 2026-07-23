@@ -3,6 +3,24 @@
 A tool under **System → Translate Mode** that reads the text a DS game is drawing
 **right now** and lets you translate it.
 
+## Translate ROM text (real game text → translated .nds)
+
+A second tool under **System → Translate ROM text** works at the ROM level (not
+the screen): it parses the cartridge's NDS filesystem, finds the game's
+pointer-table Shift-JIS text files and shows every string as **real, readable,
+editable text**. Type a translation and **Create translated ROM...** writes a
+patched `.nds`.
+
+* Decodes the game's actual cp932 text (rules, menus, titles, pauses, prompts…).
+* Untranslated lines are written back byte-for-byte (safe round-trip); only the
+  strings you edit are re-encoded.
+* This first version patches **in place**, so a translation must fit the space of
+  the original string (Japanese is 2 bytes/char, so there is usually room). Lines
+  that don't fit are reported and left untouched — shortening them or a full ROM
+  repack (planned) is needed.
+* Not yet covered: character descriptions packed inside the `.aar` (ALAR/DSTX)
+  archives, and menu buttons that are graphics rather than text.
+
 ## Why it reads tiles, not RAM
 
 DS games don't keep their on-screen text as normal Shift-JIS/Unicode in memory —
