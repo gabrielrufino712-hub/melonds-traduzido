@@ -122,7 +122,7 @@ struct NdsFS
     u32 rd32(u32 o) const { return (u32)d[o] | ((u32)d[o+1]<<8) | ((u32)d[o+2]<<16) | ((u32)d[o+3]<<24); }
 };
 void fsWalk(const NdsFS& fs, u16 did, const QString& path,
-            std::vector<std::tuple<QString,u32,u32>>& out)
+            std::vector<std::tuple<QString,u32,u32,u32>>& out)
 {
     u32 ent = fs.fntOff + (did & 0xFFF) * 8;
     if (ent + 6 > fs.len) return;
@@ -145,7 +145,7 @@ void fsWalk(const NdsFS& fs, u16 did, const QString& path,
         else
         {
             u32 fa = fs.fatOff + fid * 8;
-            if (fa + 8 <= fs.len) out.push_back(std::make_tuple(path + name, fs.rd32(fa), fs.rd32(fa + 4)));
+            if (fa + 8 <= fs.len) out.push_back(std::make_tuple(path + name, (u32)fid, fs.rd32(fa), fs.rd32(fa + 4)));
             fid++;
         }
     }
@@ -296,19 +296,19 @@ void TranslateWindow::onScan()
     if (fs.fntOff + 8 > len || fs.fatOff + 8 > len)
     { QMessageBox::warning(this, "Translate Mode", "Could not read the ROM filesystem."); return; }
 
-    std::vector<std::tuple<QString,u32,u32>> files;
+    std::vector<std::tuple<QString,u32,u32,u32>> files;
     fsWalk(fs, 0xF000, "", files);
 
     Files.clear();
     int total = 0;
     for (auto& f : files)
     {
-        QString path = std::get<0>(f); u32 s = std::get<1>(f), e = std::get<2>(f);
+        QString path = std::get<0>(f); u32 id = std::get<1>(f), s = std::get<2>(f), e = std::get<3>(f);
         if (e <= s || e > len) continue;
         QVector<QString> strs; QVector<QByteArray> raws;
         if (!parsePtr(d + s, e - s, strs, raws)) continue;
         RomTextFile rt;
-        rt.path = path; rt.start = s; rt.end = e;
+        rt.path = path; rt.id = id; rt.start = s; rt.end = e;
         rt.originals = strs; rt.raws = raws;
         rt.translations = QVector<QString>(strs.size());
         rt.active = QVector<char>(strs.size(), 0);
@@ -514,8 +514,9 @@ void TranslateWindow::onCreateRom()
     u32 len = 0; const u8* d = romData(len);
     if (!d || len == 0) { QMessageBox::warning(this, "Translate Mode", "No cartridge ROM loaded."); return; }
     QByteArray rom((const char*)d, (int)len);
+    u32 fatOff = (u32)((u8)rom[0x48] | ((u8)rom[0x49]<<8) | ((u8)rom[0x4A]<<16) | ((u8)rom[0x4B]<<24));
 
-    int patchedFiles = 0, patchedStrings = 0, tooBig = 0;
+    int patchedFiles = 0, patchedStrings = 0, inPlace = 0, grown = 0, offOver = 0;
     QStringList overflow;
     for (const RomTextFile& f : Files)
     {
@@ -525,36 +526,59 @@ void TranslateWindow::onCreateRom()
 
         int count = f.originals.size();
         QByteArray blob; QVector<int> offs;
+        bool offOverflow = false;
         for (int i = 0; i < count; i++)
         {
+            if (blob.size() > 0xFFFF) offOverflow = true;
             offs.append(blob.size());
             blob.append(f.translations[i].isEmpty() ? f.raws[i] : sjisEncode(f.translations[i]));
             blob.append('\0');
         }
         QByteArray rebuilt;
         rebuilt.append((char)(count & 0xFF)); rebuilt.append((char)((count >> 8) & 0xFF));
-        bool offOverflow = false;
         for (int o : offs)
-        {
-            if (o > 0xFFFF) offOverflow = true;
-            rebuilt.append((char)(o & 0xFF)); rebuilt.append((char)((o >> 8) & 0xFF));
-        }
+        { rebuilt.append((char)(o & 0xFF)); rebuilt.append((char)((o >> 8) & 0xFF)); }
         rebuilt.append(blob);
 
-        u32 slot = f.end - f.start;
-        if (offOverflow || (u32)rebuilt.size() > slot)
+        if (offOverflow)
         {
-            tooBig++;
-            if (overflow.size() < 12) overflow << QString("%1 (+%2 bytes)").arg(f.path).arg((int)rebuilt.size() - (int)slot);
+            // the pointer table is u16, so the string region can't exceed 64KB
+            offOver++;
+            if (overflow.size() < 12) overflow << (f.path + " (>64KB pointer table)");
             continue;
         }
-        memcpy(rom.data() + f.start, rebuilt.constData(), rebuilt.size());
-        for (u32 k = f.start + rebuilt.size(); k < f.end; k++) rom[(int)k] = 0;
+
+        u32 slot = f.end - f.start;
+        if ((u32)rebuilt.size() <= slot)
+        {
+            memcpy(rom.data() + f.start, rebuilt.constData(), rebuilt.size());
+            for (u32 k = f.start + rebuilt.size(); k < f.end; k++) rom[(int)k] = 0;
+            inPlace++;
+        }
+        else
+        {
+            // repack: append at end of ROM (4-byte aligned) and repoint the FAT entry
+            while (rom.size() % 4) rom.append((char)0);
+            u32 newStart = (u32)rom.size();
+            rom.append(rebuilt);
+            u32 newEnd = (u32)rom.size();
+            u32 fe = fatOff + f.id * 8;
+            rom[(int)(fe+0)] = (char)(newStart & 0xFF);   rom[(int)(fe+1)] = (char)((newStart>>8)&0xFF);
+            rom[(int)(fe+2)] = (char)((newStart>>16)&0xFF); rom[(int)(fe+3)] = (char)((newStart>>24)&0xFF);
+            rom[(int)(fe+4)] = (char)(newEnd & 0xFF);     rom[(int)(fe+5)] = (char)((newEnd>>8)&0xFF);
+            rom[(int)(fe+6)] = (char)((newEnd>>16)&0xFF); rom[(int)(fe+7)] = (char)((newEnd>>24)&0xFF);
+            grown++;
+        }
         patchedFiles++;
         for (const QString& t : f.translations) if (!t.isEmpty()) patchedStrings++;
     }
 
-    if (patchedFiles == 0 && tooBig == 0)
+    // update header "total used ROM size" so the whole image is loaded
+    { u32 sz = (u32)rom.size();
+      rom[0x80] = (char)(sz & 0xFF); rom[0x81] = (char)((sz>>8)&0xFF);
+      rom[0x82] = (char)((sz>>16)&0xFF); rom[0x83] = (char)((sz>>24)&0xFF); }
+
+    if (patchedFiles == 0 && offOver == 0)
     { QMessageBox::information(this, "Translate Mode", "No translations entered yet."); return; }
 
     QString fn = QFileDialog::getSaveFileName(this, "Save translated ROM", "translated.nds", "Nintendo DS ROM (*.nds)");
@@ -563,14 +587,13 @@ void TranslateWindow::onCreateRom()
     if (!out.open(QIODevice::WriteOnly)) { QMessageBox::critical(this, "Translate Mode", "Could not write the output file."); return; }
     out.write(rom); out.close();
 
-    QString msg = QString("Translated ROM written to:\n%1\n\nFiles patched: %2\nStrings patched: %3")
-                  .arg(fn).arg(patchedFiles).arg(patchedStrings);
-    if (tooBig)
-        msg += QString("\n\n%1 file(s) did NOT fit (translation longer than original space):\n - %2")
-               .arg(tooBig).arg(overflow.join("\n - "));
+    QString msg = QString("Translated ROM written to:\n%1\n\nFiles patched: %2 (in place: %3, repacked: %4)\nStrings patched: %5")
+                  .arg(fn).arg(patchedFiles).arg(inPlace).arg(grown).arg(patchedStrings);
+    if (offOver)
+        msg += QString("\n\n%1 file(s) skipped (text region over 64KB):\n - %2").arg(offOver).arg(overflow.join("\n - "));
     QMessageBox::information(this, "Translate Mode", msg);
-    lblStatus->setText(QString("Saved translated ROM (%1 files, %2 strings, %3 didn't fit).")
-                       .arg(patchedFiles).arg(patchedStrings).arg(tooBig));
+    lblStatus->setText(QString("Saved translated ROM (%1 files: %2 in place, %3 repacked).")
+                       .arg(patchedFiles).arg(inPlace).arg(grown));
 }
 
 // ---------------------------------------------------------------------------

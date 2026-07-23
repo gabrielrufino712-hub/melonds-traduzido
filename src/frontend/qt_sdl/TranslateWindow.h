@@ -50,6 +50,7 @@ namespace melonDS { class NDS; }
 struct RomTextFile
 {
     QString path;
+    melonDS::u32 id = 0;
     melonDS::u32 start = 0;
     melonDS::u32 end = 0;
     QVector<QString> originals;
