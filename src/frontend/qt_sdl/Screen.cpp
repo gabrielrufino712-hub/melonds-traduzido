@@ -659,9 +659,46 @@ void ScreenPanel::osdAddMessage(unsigned int color, const char* text)
     osdMutex.unlock();
 }
 
+void ScreenPanel::setTransOverlay(const QString& text)
+{
+    osdMutex.lock();
+    if (text != transText)
+    {
+        transText = text;
+        transPending = true;
+    }
+    osdMutex.unlock();
+}
+
 void ScreenPanel::osdUpdate()
 {
     osdMutex.lock();
+
+    // rebuild the translation subtitle (GL calls happen here, in
+    // the paint/context, never from the Translate Mode thread)
+    if (transPending)
+    {
+        if (transHasTex) { osdDeleteItem(&transItem); transHasTex = false; }
+        transPending = false;
+        if (transText.isEmpty())
+            transActive = false;
+        else
+        {
+            QByteArray u = transText.toUtf8();
+            strncpy(transItem.text, u.constData(), 255); transItem.text[255] = '\0';
+            transItem.id = 0x7FFFFFF0;
+            transItem.color = 0xFFFFFF;
+            transItem.rainbowstart = -1;
+            transItem.rendered = false;
+            transActive = true;
+        }
+    }
+    if (transActive && !transItem.rendered)
+    {
+        osdRenderItem(&transItem);
+        transItem.rendered = true;
+        transHasTex = true;
+    }
 
     qint64 tick_now = QDateTime::currentMSecsSinceEpoch();
     qint64 tick_min = tick_now - 2500;
@@ -867,6 +904,17 @@ void ScreenPanelNative::paintEvent(QPaintEvent* event)
             it++;
         }
 
+        osdMutex.unlock();
+    }
+
+    // translation subtitle, centred near the bottom
+    if (transActive && !transItem.bitmap.isNull())
+    {
+        osdMutex.lock();
+        painter.resetTransform();
+        int bw = transItem.bitmap.width();
+        int bh = transItem.bitmap.height();
+        painter.drawImage((width() - bw) / 2, height() - bh - 10, transItem.bitmap);
         osdMutex.unlock();
     }
 }
@@ -1265,6 +1313,34 @@ void ScreenPanelGL::drawScreen()
         glDisable(GL_BLEND);
         glUseProgram(0);
 
+        osdMutex.unlock();
+    }
+
+    // translation subtitle, centred near the bottom (works with the GL renderer)
+    if (transActive && osdTextures.count(transItem.id))
+    {
+        osdMutex.lock();
+        glUseProgram(osdShader);
+        glUniform2f(osdScreenSizeULoc, w, h);
+        glUniform1f(osdScaleFactorULoc, factor);
+        glUniform1f(osdTexScaleULoc, 1.0);
+        glBindBuffer(GL_ARRAY_BUFFER, osdVertexBuffer);
+        glBindVertexArray(osdVertexArray);
+        glActiveTexture(GL_TEXTURE0);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+        int bw = transItem.bitmap.width();
+        int bh = transItem.bitmap.height();
+        int lw = (int)(w / factor);
+        int lh = (int)(h / factor);
+        glBindTexture(GL_TEXTURE_2D, osdTextures[transItem.id]);
+        glUniform2i(osdPosULoc, (lw - bw) / 2, lh - bh - 10);
+        glUniform2i(osdSizeULoc, bw, bh);
+        glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
+
+        glDisable(GL_BLEND);
+        glUseProgram(0);
         osdMutex.unlock();
     }
 

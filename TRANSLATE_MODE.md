@@ -51,6 +51,19 @@ it once on demand. Requirements and limits: needs **internet**; only works on
 lines that are already **real text** (via table / Teach / Auto-OCR), not raw tile
 codes; and it uses an unofficial endpoint that may rate-limit or change.
 
+## Translation overlay on the game
+
+Tick **Overlay on game** to show the translations as a subtitle drawn over the
+emulator screen (bottom-centre), in real time, on both the software and OpenGL
+renderers. This does NOT depend on the game having a latin font — it draws over
+the picture like a fan-translation subtitle. Note: the on-screen font is
+ASCII-only, so accents are approximated (`tradução` shows as `traducao`).
+
+Writing the translation back into the game's own tiles (**Apply to screen**) only
+works if the game's font actually contains those letters as tiles — most Japanese
+games don't, which is why the overlay is the reliable way to see a translation
+live.
+
 ## Seeing the actual characters
 
 The on-screen text is drawn from the game's own font, so each line first appears

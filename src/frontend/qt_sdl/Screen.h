@@ -70,6 +70,9 @@ public:
     void osdSetEnabled(bool enabled);
     void osdAddMessage(unsigned int color, const char* msg);
 
+    // Persistent translation subtitle overlay (set from Translate Mode).
+    void setTransOverlay(const QString& text);
+
     virtual void drawScreen() {}// = 0;
 
 private slots:
@@ -121,6 +124,13 @@ protected:
     bool osdEnabled;
     unsigned int osdID;
     std::deque<OSDItem> osdItems;
+
+    // translation subtitle overlay
+    OSDItem transItem {};
+    QString transText;
+    bool transActive = false;
+    bool transPending = false;
+    bool transHasTex = false;
 
     QPixmap splashLogo;
     OSDItem splashText[3];

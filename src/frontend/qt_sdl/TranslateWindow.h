@@ -136,6 +136,7 @@ private:
     void readScreen(melonDS::GPU2D& eng, bool engineA, QVector<ScreenLine>& out);
     void readSprites(melonDS::GPU2D& eng, int engineNum, QVector<ScreenLine>& out);
     int  readTileIndex(melonDS::GPU2D& eng, bool engineA, int bg, int dsx, int dsy);
+    bool isTextTile(int engineNum, int kind, int bg, int tile);
     void writeTileBG(int engineNum, int bg, int dsx, int dsy, int tileIndex);
     QVector<int> encodeTiles(const QString& text);
     QString decodeLine(const QVector<int>& tiles);
@@ -161,6 +162,7 @@ private:
     QCheckBox*    chkHex = nullptr;
     QCheckBox*    chkGlyph = nullptr;
     QCheckBox*    chkTranslate = nullptr;
+    QCheckBox*    chkOverlay = nullptr;
     QLineEdit*    txtLang = nullptr;
     QSpinBox*     spnMinRun = nullptr;
     QLabel*       lblStatus = nullptr;

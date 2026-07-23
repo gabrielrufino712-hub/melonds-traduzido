@@ -57,6 +57,8 @@
 #include "main.h"
 #include "EmuInstance.h"
 #include "EmuThread.h"
+#include "Window.h"
+#include "Screen.h"
 #include "NDS.h"
 #include "GPU.h"
 
@@ -168,6 +170,10 @@ TranslateWindow::TranslateWindow(QWidget* parent) : QDialog(parent)
     connect(btnTr, &QPushButton::clicked, this, &TranslateWindow::onTranslateNow);
     bar2->addWidget(btnTr);
 
+    chkOverlay = new QCheckBox("Overlay on game", this);
+    chkOverlay->setToolTip("Show the translations as a subtitle over the emulator screen.");
+    bar2->addWidget(chkOverlay);
+
     bar2->addStretch();
     root->addLayout(bar2);
 
@@ -271,6 +277,48 @@ int TranslateWindow::readTileIndex(GPU2D& eng, bool engineA, int bg, int dsx, in
     return ent & 0x3FF;
 }
 
+// A tile "looks like text" if it is drawn in very few colours (font glyphs are
+// mono: 1 ink colour, maybe an outline) with a sane ink density. Background art
+// and gradients use many colours / are solid, so they are rejected. This is what
+// separates real dialogue/HUD text from decorative graphics.
+bool TranslateWindow::isTextTile(int engineNum, int kind, int bg, int tile)
+{
+    NDS* nds = emuInstance ? emuInstance->getNDS() : nullptr;
+    if (!nds) return false;
+    GPU2D& eng = engineNum ? nds->GPU.GPU2D_B : nds->GPU.GPU2D_A;
+
+    u8* vram = nullptr; u32 mask = 0; bool bpp8 = false; u32 charBase = 0;
+    if (kind == 0)
+    {
+        u16 bgcnt = eng.BGCnt[bg]; u32 d = eng.DispCnt;
+        bpp8 = bgcnt & 0x80;
+        charBase = ((bgcnt >> 2) & 0x3) * 0x4000u + ((engineNum == 0) ? (((d >> 24) & 0x7) * 0x10000u) : 0u);
+        eng.GetBGVRAM(vram, mask);
+    }
+    else eng.GetOBJVRAM(vram, mask);
+    if (!vram || mask == 0) return false;
+
+    u32 tb = bpp8 ? 64u : 32u;
+    u32 base = charBase + (u32)tile * tb;
+    int ink = 0;
+    int colors[8]; int nc = 0; // distinct non-zero colour values (capped)
+    for (int p = 0; p < 64; p++)
+    {
+        int v;
+        if (bpp8) v = vram[(base + p) & mask];
+        else { u8 b = vram[(base + (p >> 1)) & mask]; v = (p & 1) ? (b >> 4) : (b & 0x0F); }
+        if (v == 0) continue;
+        ink++;
+        bool seen = false;
+        for (int i = 0; i < nc; i++) if (colors[i] == v) { seen = true; break; }
+        if (!seen && nc < 8) colors[nc++] = v;
+    }
+    if (ink < 3) return false;                 // basically empty
+    if (ink > 46) return false;                // ~72% filled -> solid/background
+    if (nc > 3) return false;                  // many colours -> art, not text
+    return true;
+}
+
 // which BGs are readable as text for a given engine
 static bool isTextBg(u32 dispcnt, int bg)
 {
@@ -297,36 +345,44 @@ void TranslateWindow::readScreen(GPU2D& eng, bool engineA, QVector<ScreenLine>& 
         if (!(eng.LayerEnable & (1 << bg))) continue;
         if (!isTextBg(dispcnt, bg)) continue;
 
-        // read the visible tile grid
+        // read the visible tile grid + classify each tile as text-like or not
+        int engineNum = engineA ? 0 : 1;
         std::vector<std::vector<int>> grid(kTileRows, std::vector<int>(kTileCols, 0));
-        std::unordered_map<int, int> hist;
+        std::vector<std::vector<char>> isText(kTileRows, std::vector<char>(kTileCols, 0));
+        std::unordered_map<int, char> textCache;
         for (int vy = 0; vy < kTileRows; vy++)
             for (int vx = 0; vx < kTileCols; vx++)
             {
                 int t = readTileIndex(eng, engineA, bg, vx * 8, vy * 8);
                 if (t < 0) t = 0;
                 grid[vy][vx] = t;
-                hist[t]++;
+                auto ci = textCache.find(t);
+                if (ci == textCache.end())
+                {
+                    char tv = isTextTile(engineNum, 0, bg, t) ? 1 : 0;
+                    textCache[t] = tv;
+                    isText[vy][vx] = tv;
+                }
+                else isText[vy][vx] = ci->second;
             }
 
-        // blank = most frequent tile (usually the background/space glyph)
-        int blank = 0, best = -1;
-        for (auto& kv : hist) if (kv.second > best) { best = kv.second; blank = kv.first; }
-
-        // group each row into runs of non-blank tiles
+        // group each row into runs of consecutive text tiles only
         for (int vy = 0; vy < kTileRows; vy++)
         {
             int vx = 0;
             while (vx < kTileCols)
             {
-                if (grid[vy][vx] == blank) { vx++; continue; }
+                if (!isText[vy][vx]) { vx++; continue; }
                 int s = vx;
                 QVector<int> tiles;
-                while (vx < kTileCols && grid[vy][vx] != blank) { tiles.append(grid[vy][vx]); vx++; }
-                if (tiles.size() >= minRun)
+                while (vx < kTileCols && isText[vy][vx]) { tiles.append(grid[vy][vx]); vx++; }
+                // reject a run that is one tile repeated (flat fill, not text)
+                bool varied = false;
+                for (int q = 1; q < tiles.size(); q++) if (tiles[q] != tiles[0]) { varied = true; break; }
+                if (tiles.size() >= minRun && varied)
                 {
                     ScreenLine ln;
-                    ln.kind = 0; ln.engineNum = engineA ? 0 : 1;
+                    ln.kind = 0; ln.engineNum = engineNum;
                     ln.bg = bg; ln.ty = vy; ln.c0 = s; ln.c1 = vx - 1;
                     ln.tiles = tiles;
                     ln.sig = lineSignature(0, bg, tiles);
@@ -443,6 +499,7 @@ void TranslateWindow::readSprites(GPU2D& eng, int engineNum, QVector<ScreenLine>
         int x = a1 & 0x1FF; if (x & 0x100) x -= 0x200;
         if (y >= 192 || x <= -32 || x >= 256) continue;
         int tile = a2 & 0x3FF;
+        if (!isTextTile(engineNum, 1, 0, tile)) continue;   // only glyph-like sprites
         sprs.push_back({ x, y, tile, i });
     }
     if (sprs.empty()) return;
@@ -603,6 +660,38 @@ void TranslateWindow::refresh(bool force)
 
     if (chkTranslate && chkTranslate->isChecked())
         doAutoTranslate();
+
+    // push the translation subtitle overlay onto the game screen
+    if (chkOverlay)
+    {
+        QString ov;
+        if (chkOverlay->isChecked())
+        {
+            // the OSD font is ASCII-only, so approximate accents (tradução -> traducao)
+            auto ascii = [](QString s)
+            {
+                s = s.normalized(QString::NormalizationForm_KD);
+                QString o;
+                for (QChar c : s)
+                {
+                    if (c.category() == QChar::Mark_NonSpacing) continue;
+                    ushort u = c.unicode();
+                    o += (u >= 0x20 && u <= 0x7E) ? c : QChar('?');
+                }
+                return o;
+            };
+            int lines = 0;
+            auto add = [&](const QVector<ScreenLine>& v)
+            {
+                for (const auto& l : v)
+                    if (!l.translation.isEmpty() && lines < 4)
+                    { ov += (ov.isEmpty() ? QString() : QString(" / ")) + ascii(l.translation); lines++; }
+            };
+            add(topLines); add(botLines);
+        }
+        MainWindow* mw = emuInstance ? emuInstance->getMainWindow() : nullptr;
+        if (mw && mw->panel) mw->panel->setTransOverlay(ov);
+    }
 }
 
 void TranslateWindow::rebuildTable(QTableWidget* tbl, const QVector<ScreenLine>& lines)
