@@ -7,19 +7,45 @@ a patched (translated) `.nds` ROM.
 ## What it does
 
 When you open **System → Translate Mode** a second window appears. While a game
-is running it analyses the console's main RAM in real time and logs every unique
-readable string it finds, in two encodings:
+is running it analyses the console's memory in real time and logs every unique
+readable string it finds. It is a general-purpose text tool for ANY DS game.
 
-* **ASCII** – Latin text (menus, "OK", file names, some debug text).
-* **Shift-JIS (cp932)** – the encoding Japanese games use, including
-  *One Piece Gigant Battle 2 Shin Sekai*. A full cp932→Unicode table is compiled
-  into the emulator (`TranslateSJIS.h`) so Japanese text is decoded and shown
-  directly – no external codec needed.
+## Encodings (works on any game)
 
-Each captured line shows: capture time, main-RAM address, encoding, the original
-text and an editable **Translation** column.
+Pick the **Encoding** in the toolbar:
 
-### Workflow
+* **ASCII** – Latin text.
+* **Shift-JIS (JP)** – cp932 Japanese (a full table is compiled in).
+* **UTF-16LE** – 2-byte little-endian Unicode, used by many DS games.
+* **UTF-8**.
+* **Custom table (.tbl)** – for games with their own encoding: load a Thingy-style
+  table (`Load table...`, lines like `41=A` or `8140= `) and the tool decodes and
+  re-encodes text with it.
+
+Check **Japanese only** to keep just strings containing real kana/kanji (cuts the
+random-byte noise on JP games).
+
+## Where it looks
+
+* **Scan RAM** / **Auto-scan RAM** – reads the running game's main RAM.
+* **Scan ROM (full)** – reads the whole cartridge ROM directly. Text captured this
+  way carries its exact ROM offset, so patching it is 100% precise.
+
+## Finding text that isn't obvious
+
+* **Relative search** – type a short piece of text you can see on screen; the tool
+  finds where a matching single-byte sequence is stored in RAM even without a
+  table. Use the results to figure out the game's character codes and build a
+  `.tbl`.
+* **Highlight on-screen** – when checked, the strings that just appeared in memory
+  on each scan are highlighted and scrolled to, so you see what is on screen now.
+* **Inspect (click screen)** – EXPERIMENTAL. Arm it, then click text on the bottom
+  (touch) screen; it reads the background tiles under the cursor (both 2D engines,
+  BG0/BG1) and, if a tile `.tbl` is loaded, decodes them. Useful to identify which
+  layer and tiles a piece of on-screen text uses.
+* **Guide** – an in-app button that shows this step-by-step workflow.
+
+## Workflow
 
 1. **Boot the game** and open **System → Translate Mode**.
 2. Text appears automatically as the game runs (toggle **Auto-scan**, or press

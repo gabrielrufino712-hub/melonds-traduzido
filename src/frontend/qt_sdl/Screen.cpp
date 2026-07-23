@@ -31,6 +31,7 @@
 
 #include "main.h"
 #include "EmuInstance.h"
+#include "TranslateWindow.h"
 
 #include "NDS.h"
 #include "GPU.h"
@@ -261,6 +262,13 @@ void ScreenPanel::mousePressEvent(QMouseEvent* event)
 
     if (layout.GetTouchCoords(x, y, false))
     {
+        // Translate Mode "Inspect" pick: read the tiles under the click instead
+        // of forwarding it as a touch to the game.
+        if (TranslateWindow::currentDlg && TranslateWindow::currentDlg->isInspectArmed())
+        {
+            TranslateWindow::currentDlg->screenPick(x, y);
+            return;
+        }
         touching = true;
         emuInstance->touchScreen(x, y);
     }
