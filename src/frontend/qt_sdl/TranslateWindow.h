@@ -56,7 +56,7 @@ struct RomTextFile
     QVector<QString> translations;
     QVector<QByteArray> raws;
     QVector<char> active;             // currently present in RAM?
-    QVector<melonDS::u32> ramAddr;    // where it was found in main RAM
+    QVector<QVector<melonDS::u32>> addrs;  // all RAM addresses where it was found
 };
 
 class TranslateWindow : public QDialog
@@ -101,6 +101,7 @@ private:
     QPushButton*  btnPause = nullptr;
     QCheckBox*    chkHighlight = nullptr;
     QCheckBox*    chkFollow = nullptr;
+    QCheckBox*    chkActiveOnly = nullptr;
     QLineEdit*    txtFilter = nullptr;
     QLabel*       lblStatus = nullptr;
 

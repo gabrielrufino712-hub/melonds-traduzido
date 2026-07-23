@@ -217,6 +217,10 @@ TranslateWindow::TranslateWindow(QWidget* parent) : QDialog(parent)
     chkFollow->setToolTip("Auto-scroll to the active text.");
     bar->addWidget(chkFollow);
 
+    chkActiveOnly = new QCheckBox("Active only", this);
+    chkActiveOnly->setToolTip("Show only the strings currently loaded in RAM.");
+    bar->addWidget(chkActiveOnly);
+
     bar->addWidget(new QLabel("Filter:", this));
     txtFilter = new QLineEdit(this);
     txtFilter->setPlaceholderText("filter by text or file...");
@@ -308,7 +312,7 @@ void TranslateWindow::onScan()
         rt.originals = strs; rt.raws = raws;
         rt.translations = QVector<QString>(strs.size());
         rt.active = QVector<char>(strs.size(), 0);
-        rt.ramAddr = QVector<u32>(strs.size(), 0);
+        rt.addrs = QVector<QVector<u32>>(strs.size());
         Files.push_back(rt);
         total += strs.size();
     }
@@ -346,7 +350,8 @@ void TranslateWindow::scanActive()
     const u8* ram = nds->MainRAM;
     const u32 size = nds->MainRAMMask; // scan [0, size)
     // clear
-    for (auto& f : Files) for (int i = 0; i < f.active.size(); i++) f.active[i] = 0;
+    for (auto& f : Files)
+        for (int i = 0; i < f.active.size(); i++) { f.active[i] = 0; f.addrs[i].clear(); }
 
     for (u32 i = 0; i + 4 < size; i++)
     {
@@ -362,7 +367,7 @@ void TranslateWindow::scanActive()
             if (memcmp(ram + i, r.constData(), rl) == 0)
             {
                 Files[fi].active[si] = 1;
-                Files[fi].ramAddr[si] = i;
+                if (Files[fi].addrs[si].size() < 8) Files[fi].addrs[si].append(i);
             }
         }
     }
@@ -379,12 +384,14 @@ void TranslateWindow::onTick()
     updatingTable = true;
     QColor hi(120, 220, 120);
     int firstActive = -1;
+    bool activeOnly = chkActiveOnly->isChecked();
     for (int r = 0; r < Rows.size(); r++)
     {
         int fi = Rows[r].first, si = Rows[r].second;
         bool on = Files[fi].active[si];
         for (int c = 0; c < COL_COUNT; c++)
             if (auto* it = table->item(r, c)) it->setBackground(on ? QBrush(hi) : QBrush());
+        table->setRowHidden(r, activeOnly && !on);
         if (on && firstActive < 0) firstActive = r;
     }
     updatingTable = false;
@@ -487,9 +494,11 @@ void TranslateWindow::onApplyLive()
             QByteArray enc = sjisEncode(f.translations[i]);
             int room = f.raws[i].size();
             if (enc.size() > room) { enc = enc.left(room); trunc++; }
-            u32 addr = f.ramAddr[i];
-            for (int k = 0; k < enc.size(); k++) nds->MainRAM[(addr + k) & mask] = (u8)enc[k];
-            for (int k = enc.size(); k < room; k++) nds->MainRAM[(addr + k) & mask] = 0x20; // pad spaces
+            for (u32 addr : f.addrs[i])
+            {
+                for (int k = 0; k < enc.size(); k++) nds->MainRAM[(addr + k) & mask] = (u8)enc[k];
+                for (int k = enc.size(); k < room; k++) nds->MainRAM[(addr + k) & mask] = 0x20;
+            }
             n++;
         }
     lblStatus->setText(QString("Applied %1 active translation(s) to RAM%2.")
