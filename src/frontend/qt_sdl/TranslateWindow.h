@@ -16,19 +16,18 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
-// Translate Mode
-// --------------
-// A general-purpose text-reading / translation tool for ANY Nintendo DS game.
-// It scans the console main RAM (and optionally the whole cartridge ROM) in real
-// time for readable text in several encodings (ASCII, Shift-JIS/cp932, UTF-16LE,
-// UTF-8, or a user-supplied custom character table .tbl), logs every unique
-// string with its address and raw bytes, lets the user pause the game, edit a
-// translation, preview it live in RAM, and finally bake a patched .nds ROM.
+// Translate Mode - live on-screen text reader
+// --------------------------------------------
+// Instead of scanning raw RAM (which is full of noise), this reads what the DS
+// is ACTUALLY drawing right now: it walks the background tilemaps of both 2D
+// engines every refresh and turns the visible tile rows into text lines. The
+// result is split into two tables - Top screen and Bottom screen - so you always
+// see only the text that is on screen at this moment, in real time.
 //
-// For games that use their own encoding (very common on the DS) it supports:
-//   * loading a custom character table (.tbl, Thingy format),
-//   * a relative-search to locate on-screen text and help build such a table,
-//   * exporting/importing all captured text as a plain .txt for bulk editing.
+// Tiles are the game's own font glyph indices. Load a tile table (.tbl, lines
+// like "15c=A") to see them as readable letters; without one the raw tile codes
+// are shown so you can build the table. "Inspect (click screen)" lets you click
+// text on the bottom screen and highlights the matching line in the table.
 
 #ifndef TRANSLATEWINDOW_H
 #define TRANSLATEWINDOW_H
@@ -40,7 +39,6 @@
 #include <QHash>
 #include <QVector>
 #include <QPair>
-#include <vector>
 
 #include "types.h"
 
@@ -54,47 +52,33 @@ class QLineEdit;
 class QLabel;
 class EmuInstance;
 
-namespace melonDS { class NDS; }
+namespace melonDS { class NDS; class GPU2D; }
 
-enum TranslateEncoding
+// A run of tiles forming one on-screen text line.
+struct ScreenLine
 {
-    ENC_ASCII = 0,
-    ENC_SJIS,
-    ENC_UTF16LE,
-    ENC_UTF8,
-    ENC_TABLE
+    int kind = 0;        // 0 = BG layer, 1 = OBJ (sprite)
+    int engineNum = 0;   // 0 = engine A, 1 = engine B
+    int bg = 0;
+    int ty = 0;          // visible tile row
+    int c0 = 0, c1 = 0;  // visible tile column range
+    QVector<int> tiles;
+    QVector<int> oam;    // OBJ: source sprite indices, in order
+    QString sig;         // stable signature, key for translations
+    QString text;        // decoded text (or hex tile codes)
+    QString translation;
 };
 
-enum TranslateSource
-{
-    SRC_RAM = 0,
-    SRC_ROM = 1
-};
-
-// One captured string.
-struct TranslateEntry
-{
-    melonDS::u32 Address = 0;       // main-RAM address where it was first seen
-    qint64       RomOffset = -1;    // offset in the cart ROM (if known), else -1
-    int          Source = SRC_RAM;
-    QByteArray   RawBytes;          // exact source bytes (used for search/patch)
-    QString      Original;          // decoded, human-readable original text
-    QString      Translation;       // user-supplied replacement (empty = untouched)
-    int          Encoding = ENC_SJIS;
-    bool         PatchedRAM = false;
-};
-
-// A custom character table (Thingy-style .tbl: "HEX=value" per line).
+// Custom tile/character table (Thingy-style .tbl: "HEX=value" per line).
 struct CharTable
 {
-    QHash<melonDS::u16, QString> two;                 // 2-byte code -> string
-    QHash<melonDS::u8,  QString> one;                 // 1-byte code -> string
-    QVector<QPair<QString, QByteArray>> encodeList;   // string -> bytes (longest first)
+    QHash<melonDS::u32, QString> byCode;                  // tile/char code -> string
+    QVector<QPair<QString, melonDS::u32>> enc;            // string -> code (longest first)
     bool loaded = false;
 
-    void clear() { two.clear(); one.clear(); encodeList.clear(); loaded = false; }
+    void clear() { byCode.clear(); enc.clear(); loaded = false; }
     bool isLoaded() const { return loaded; }
-    void buildEncodeList();
+    void buildEnc();
 };
 
 class TranslateWindow : public QDialog
@@ -119,71 +103,64 @@ public:
     }
     static void closeDlg() { currentDlg = nullptr; }
 
-    // Called by the emulator screen widget when the user clicks while the
-    // experimental "Inspect (click screen)" mode is armed. dsx/dsy are DS
-    // pixel coordinates on the touch (bottom) screen.
+    // Called by the emulator screen widget when the user clicks the bottom
+    // (touch) screen while "Inspect (click screen)" is armed.
     bool isInspectArmed() const { return inspectArmed; }
     void screenPick(int dsx, int dsy);
 
 private slots:
     void onTick();
-    void onScanRAM();
-    void onScanROM();
+    void onRefreshNow();
     void onTogglePause();
-    void onClear();
-    void onFilterChanged(const QString& text);
-    void onCellChanged(int row, int col);
-    void onApplyToRAM();
-    void onCreatePatchedROM();
-    void onSaveProject();
-    void onLoadProject();
     void onLoadTable();
-    void onRelativeSearch();
-    void onExportTxt();
-    void onImportTxt();
+    void onSaveTable();
+    void onTeach();
+    void onApplyLive();
     void onGuide();
     void onToggleInspect(bool on);
+    void onTopCellChanged(int row, int col);
+    void onBottomCellChanged(int row, int col);
+    void onSaveProject();
+    void onLoadProject();
+    void onExportTxt();
+    void onImportTxt();
 
 private:
-    void doScan(int source);
-    void scanBuffer(const melonDS::u8* buf, melonDS::u32 size, int source);
-    void rebuildTable();
-    void appendNewRows();
-    int  addTableRow(int entryIndex);
-    void applyHighlight(const QVector<int>& rows);
+    void refresh(bool force);
+    void readScreen(melonDS::GPU2D& eng, bool engineA, QVector<ScreenLine>& out);
+    void readSprites(melonDS::GPU2D& eng, int engineNum, QVector<ScreenLine>& out);
+    int  readTileIndex(melonDS::GPU2D& eng, bool engineA, int bg, int dsx, int dsy);
+    void writeTileBG(int engineNum, int bg, int dsx, int dsy, int tileIndex);
+    QVector<int> encodeTiles(const QString& text);
+    QString decodeLine(const QVector<int>& tiles);
+    QString lineSignature(int kind, int bg, const QVector<int>& tiles);
+    void rebuildTable(QTableWidget* tbl, const QVector<ScreenLine>& lines);
     void refreshPauseButton();
-    void addOrUpdateEntry(melonDS::u32 addr, qint64 romOffset, int source,
-                          const QByteArray& raw, const QString& text, int enc);
-    int  encodeTranslation(const TranslateEntry& e, QByteArray& out);
+    void highlightBottomLine(int lineIndex);
+    QTableWidget* activeTable();
 
     EmuInstance* emuInstance = nullptr;
 
-    QTableWidget* table = nullptr;
+    QTableWidget* tblTop = nullptr;
+    QTableWidget* tblBottom = nullptr;
     QPushButton*  btnPause = nullptr;
-    QPushButton*  btnScanRAM = nullptr;
-    QPushButton*  btnScanROM = nullptr;
+    QPushButton*  btnInspect = nullptr;
     QCheckBox*    chkAuto = nullptr;
-    QCheckBox*    chkJpOnly = nullptr;
-    QComboBox*    cmbEncoding = nullptr;
-    QSpinBox*     spnMinLen = nullptr;
-    QLineEdit*    txtFilter = nullptr;
-    QLineEdit*    txtRelSearch = nullptr;
+    QCheckBox*    chkHex = nullptr;
+    QSpinBox*     spnMinRun = nullptr;
     QLabel*       lblStatus = nullptr;
     QLabel*       lblTable = nullptr;
-    QPushButton*  btnInspect = nullptr;
-    QCheckBox*    chkHighlight = nullptr;
 
-    bool inspectArmed = false;
-    QVector<int> highlightedRows;
+    QTimer* refreshTimer = nullptr;
 
-    QTimer* scanTimer = nullptr;
-
-    std::vector<TranslateEntry> Entries;
-    QHash<QString, int> KeyToIndex;
-    int displayedEntryCount = 0;
+    QVector<ScreenLine> topLines, botLines;
+    QString lastTopSig, lastBotSig;
+    QHash<QString, QString> transBySig;   // persists translations across refreshes
 
     CharTable Table;
 
+    bool inspectArmed = false;
+    int  highlightedRow = -1;
     bool updatingTable = false;
 };
 
